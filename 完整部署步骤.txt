@@ -34,3 +34,6 @@ sudo journalctl -u crypto-bot.service -n 100 --no-pager
 # 9. 停止 / 重启
 sudo systemctl stop crypto-bot.service
 sudo systemctl restart crypto-bot.service
+
+• 如果客户在测试网或实盘中触发了 25% 熔断停机，后续调整好资金想重新开启机器人，记得去 /root/orca-strategy/ 目录下删掉 risk_state.json 文件（rm -f /root/orca-strategy/risk_state.json），否则一启动还是会读取到历史 >25% 的回撤记录并再次触发停机。
+
