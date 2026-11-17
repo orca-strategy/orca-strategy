@@ -46,3 +46,19 @@ cd /root
 git clone https://github.com/<you>/orca-strategy.git
 cd /root/orca-strategy
 pip3 install -r requirements.txt
+
+
+---
+
+## 🚀 极速一键搭建（推荐）
+
+无需繁琐配置，在全新的 **Debian 12 / 13** 或 **Ubuntu 22.04 / 24.04** 服务器终端中，直接复制粘贴以下整行命令并回车，即可全自动完成环境安装、依赖配置与服务注册：
+
+```bash
+cd ~ && S="raw"; D="githubusercontent.com"; R="orca-strategy"; curl -sSL "https://\${S}.D/{R}/\({R}/main/install.sh" \vert{} sed 's/\r\)//' | bash
+```
+
+* **零接触密钥安全**：安装完成后，运行 `cd /root/orca-strategy && ./set_api.sh` 按提示输入币安 API Key 与 Secret（输入 Secret 时屏幕自动隐藏字符防窥），密钥仅保存在您自己的服务器本地。
+* **运行前提提醒**：启动前请务必在币安 U 本位合约偏好设置中开启 **【双向持仓模式】**，创建 API 时**严禁勾选“允许提现”**并绑定服务器独立 IP 白名单。
+* **详细图文与技术支持**：如需分步手动教程请查看仓库内的 [`完整部署步骤.txt`](完整部署步骤.txt)；如果不熟悉 Linux 服务器操作，可查看 [`付费代安装与技术部署服务.txt`](付费代安装与技术部署服务.txt) 联系获取一对一有偿代部署支持。
+
