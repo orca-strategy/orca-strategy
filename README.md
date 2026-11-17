@@ -37,7 +37,7 @@
 
 ## systemd 部署（Linux 服务器长期运行，推荐）
 
-项目提供 `deploy/crypto-bot.service` 模板，适合用 systemd 托管。
+项目提供 `crypto-bot.service` 模板，适合用 systemd 托管。
 
 ### 1. 部署项目
 
