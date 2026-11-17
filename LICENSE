@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 orca-strategy
+Copyright (c) 2026 Orca Strategy V1 Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,22 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+ADDITIONAL RISK DISCLAIMER / 附加风险声明
+-------------------------------------------------------------------------------
+
+This software is a cryptocurrency futures trading bot. Cryptocurrency trading
+involves substantial risk of loss and is not suitable for every investor. The
+use of leverage can lead to losses greater than the initial deposit. Past
+performance is not indicative of future results.
+
+THE AUTHORS AND CONTRIBUTORS OF THIS SOFTWARE DO NOT PROVIDE FINANCIAL ADVICE,
+DO NOT GUARANTEE ANY PROFIT, AND ACCEPT NO LIABILITY FOR ANY FINANCIAL LOSS
+INCURRED THROUGH THE USE OF THIS SOFTWARE. USE AT YOUR OWN RISK.
+
+本软件为加密货币合约交易机器人。加密货币交易存在重大亏损风险，并非适合
+所有投资者。杠杆的使用可能导致亏损超过初始入金。历史表现不代表未来收益。
+
+本软件的作者与贡献者不提供任何投资建议、不保证任何收益，且不对因使用本
+软件而产生的任何财务损失承担责任。使用风险自负。
