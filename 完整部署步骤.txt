@@ -1,3 +1,6 @@
+提示，建议使用：一键搭建
+以下只适合懂技术的用户----
+
 # 1. 项目放到服务器
 cd /root
 git clone https://github.com/<you>/orca-strategy.git
