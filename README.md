@@ -33,3 +33,15 @@
 ---
 
 ## 架构
+
+## systemd 部署（Linux 服务器长期运行，推荐）
+
+项目提供 `deploy/crypto-bot.service` 模板，适合用 systemd 托管。
+
+### 1. 部署项目
+
+```bash
+cd /root
+git clone https://github.com/<you>/orca-strategy.git
+cd /root/orca-strategy
+pip3 install -r requirements.txt
