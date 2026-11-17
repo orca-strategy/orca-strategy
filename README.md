@@ -1,16 +1,35 @@
-## Hi there 👋
+# 虎鲸策略 V1 (Orca Strategy V1)
 
-<!--
-**orca-strategy/orca-strategy** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+> 基于币安 USDT 永续合约的多交易对量化交易机器人。
+> 采用「主动交易 + 助理交易」双层结构，支持 BTC / SPY 外部信号驱动。
 
-Here are some ideas to get you started:
+> ⚠️ **高风险提示**：本策略使用 10 倍杠杆，可能造成本金全部损失。
+> 本项目仅供学习与研究，**不构成投资建议，不保证收益，使用风险自负**。
+> 请务必先用小资金或币安测试网长时间验证后再考虑实盘。
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+---
+
+## 特性概览
+
+- **双向持仓**：多空独立管理，支持对冲
+- **市价开仓 / 限价止盈**：开仓即时成交，止盈减仓 50% 挂限价
+- **多重触发信号**
+  - BTC 2 秒脉冲（涨跌幅 ≥ 0.18%）
+  - SPY 1 分钟放量信号（涨跌幅 ≥ 0.06% + 3 倍量）
+  - BTC 1m 分型 + 放量（3~8 倍 / >8 倍极值）
+  - BTC 15m 强势突破 + 8 倍放量
+  - BTC 趋势持续 ≥8h 的价格同向确认
+  - 市场情绪（资金费率 + 成交量比率）
+- **全局风控**
+  - 峰值回撤 > 25% 熔断并全平
+  - 多空合计盈利 > 亏损 ×1.3 时锁死全平
+  - 仓位归零 18 分钟冷却
+- **工程化**
+  - 日志滚动 + 磁盘保护 + 定期截断
+  - 守护模式异常自动重启（指数退避）
+  - 启动自动清理遗留挂单
+  - WebSocket + REST 双重数据源
+
+---
+
+## 架构
