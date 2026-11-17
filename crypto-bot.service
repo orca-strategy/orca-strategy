@@ -1,0 +1,23 @@
+[Unit]
+Description=Orca Strategy V1 Crypto Trading Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/orca-strategy
+ExecStart=/usr/bin/python3 /root/orca-strategy/orca_strategy_v1.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+# 从独立环境文件加载密钥（权限 600，仅 root 可读）
+EnvironmentFile=/root/orca-strategy/.env
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
