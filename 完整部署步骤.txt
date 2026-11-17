@@ -13,6 +13,7 @@ BINANCE_API_SECRET=你的API_SECRET
 EOF
 chmod 600 /root/orca-strategy/.env
 
+【开启合约双向持仓】
 # 4. 安装 service 文件
 sudo cp /root/orca-strategy/deploy/crypto-bot.service /etc/systemd/system/crypto-bot.service
 
