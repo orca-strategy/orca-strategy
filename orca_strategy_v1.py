@@ -8,7 +8,7 @@
 #   2. 全局配置模块           —— API 密钥、交易对配置、主动/助理交易对
 #   3. 市场情绪分析器         —— 资金费率 + 成交量比率综合情绪打分
 #   4. 相关性分析器           —— 多交易对收益率相关性矩阵
-#   5. 动态风险管理器         —— 峰值回撤跟踪与熔断
+#   5. 动态风险管理器         —— 峰值回撤跟踪与熔断（含持久化）
 #   6. 全局 BTC 数据管理器    —— 统一维护 BTC K线/趋势/2秒脉冲检测
 #   7. 全局 SPY 数据管理器    —— SPY 1m/3m K线与信号
 #   8. SymbolLogger          —— 带 symbol 标识的日志器
@@ -29,6 +29,7 @@ import subprocess
 import signal
 import sys
 import datetime
+import json
 
 
 # =============================================================================
@@ -372,27 +373,64 @@ class CorrelationAnalyzer:
 
 
 # =============================================================================
-# 模块 5：动态风险管理器
+# 模块 5：动态风险管理器（含持久化）
 # =============================================================================
 
+RISK_STATE_FILE = 'risk_state.json'
+
+
 class DynamicRiskManager:
-    """峰值回撤跟踪，回撤 > 25% 触发停止"""
+    """峰值回撤跟踪，回撤 > 25% 触发停止；状态持久化到 risk_state.json"""
 
     def __init__(self):
         self.max_drawdown = 0.0
         self.current_drawdown = 0.0
         self.peak_balance = 0.0
+        self._load_state()
+
+    def _load_state(self):
+        try:
+            if os.path.exists(RISK_STATE_FILE):
+                with open(RISK_STATE_FILE, 'r') as f:
+                    s = json.load(f)
+                self.max_drawdown = float(s.get('max_drawdown', 0.0))
+                self.peak_balance = float(s.get('peak_balance', 0.0))
+                logging.info(
+                    f"[风控] 状态已加载: max_drawdown={self.max_drawdown:.2%}, "
+                    f"peak_balance={self.peak_balance:.4f}"
+                )
+        except Exception as e:
+            logging.error(f"[风控] 状态加载失败: {e}")
+
+    def _save_state(self):
+        try:
+            with open(RISK_STATE_FILE, 'w') as f:
+                json.dump(
+                    {
+                        'max_drawdown': self.max_drawdown,
+                        'peak_balance': self.peak_balance
+                    },
+                    f
+                )
+        except Exception as e:
+            logging.error(f"[风控] 状态保存失败: {e}")
 
     def update_drawdown(self, current_balance):
+        if current_balance <= 0:
+            return
         if current_balance > self.peak_balance:
             self.peak_balance = current_balance
             self.current_drawdown = 0.0
+            self._save_state()
         else:
             self.current_drawdown = (
                 (self.peak_balance - current_balance) / self.peak_balance
                 if self.peak_balance > 0 else 0.0
             )
-            self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
+            new_max = max(self.max_drawdown, self.current_drawdown)
+            if new_max != self.max_drawdown:
+                self.max_drawdown = new_max
+                self._save_state()
 
     def should_stop_trading(self):
         return self.max_drawdown > 0.25
@@ -804,8 +842,6 @@ class TradingBot:
         self.market_data = {"price": None}
         self.trend_mode = 'DUAL'
 
-        self.local_risk_manager = DynamicRiskManager()
-
         self.active_trading = False
         self._last_spy_signal_time = 0
         self._last_fen_check = 0
@@ -1126,18 +1162,11 @@ class TradingBot:
             self.logger.error(f"[增强策略异常] {e}")
 
     def update_performance(self):
-        try:
-            total_value = 0.0
-            for side in ['LONG', 'SHORT']:
-                pos = self.current_position[side]
-                if pos['quantity'] > 0 and pos['entry_price']:
-                    cp = self.market_data['price'] or self.get_current_price()
-                    if cp:
-                        value = pos['quantity'] * cp if side == 'LONG' else pos['quantity'] * pos['entry_price']
-                        total_value += value
-            self.local_risk_manager.update_drawdown(total_value)
-        except Exception as e:
-            self.logger.debug(f"[绩效更新失败] {e}")
+        """
+        全局权益回撤由 update_global_equity() 在 main_program 中统一维护，
+        此方法保留为空实现，避免使用持仓名义价值误导性地喂本地风控。
+        """
+        return
 
     # ===== 各策略分支 =====
 
@@ -1645,16 +1674,16 @@ class TradingBot:
             long_margin = self.current_position['LONG']['margin']
             short_margin = self.current_position['SHORT']['margin']
             if long_margin > bal * 0.04 and side == 'LONG':
-                self.execute_open_order('SHORT', 0.03)
-                self.logger.info("对冲-反向加空仓0.03")
+                self.execute_open_order('SHORT', 0.04)
+                self.logger.info("对冲-反向加空仓0.04")
                 self.sync_position()
             if long_margin < bal * 0.04 and side == 'LONG':
                 self.execute_open_order('SHORT', 0.02)
                 self.logger.info("对冲-反向加空仓0.02")
                 self.sync_position()
             if short_margin > bal * 0.04 and side == 'SHORT':
-                self.execute_open_order('LONG', 0.03)
-                self.logger.info("对冲-反向加多仓0.03")
+                self.execute_open_order('LONG', 0.04)
+                self.logger.info("对冲-反向加多仓0.04")
                 self.sync_position()
             if short_margin < bal * 0.04 and side == 'SHORT':
                 self.execute_open_order('LONG', 0.02)
@@ -2285,6 +2314,24 @@ def initialize_global_client():
                 return False
 
 
+def update_global_equity():
+    """从币安账户拉取总权益，喂给全局风控（峰值回撤熔断数据源）"""
+    try:
+        acct = client.futures_account()
+        equity = float(acct.get('totalMarginBalance', 0))
+        if equity > 0:
+            global_risk_manager.update_drawdown(equity)
+            logging.debug(
+                f"[全局风控] 权益={equity:.4f}, 峰值={global_risk_manager.peak_balance:.4f}, "
+                f"当前回撤={global_risk_manager.current_drawdown:.2%}, "
+                f"最大回撤={global_risk_manager.max_drawdown:.2%}"
+            )
+        else:
+            logging.warning(f"[全局风控] 获取到无效权益: {equity}")
+    except Exception as e:
+        logging.error(f"[全局风控] 权益更新失败: {e}")
+
+
 def global_data_updater():
     """后台线程：每60秒刷新 BTC 3m 数据/趋势，SPY 1m/3m 数据"""
     while True:
@@ -2619,8 +2666,13 @@ def main_program():
                     logging.warning("长时间无成功操作，但已禁用WebSocket手动重启，依赖自动重连")
                     last_successful_operation = time.time()
 
+                # 全局风控：每轮刷新账户权益并检查峰值回撤熔断
+                update_global_equity()
                 if global_risk_manager.should_stop_trading():
-                    logging.error("[全局风险] 触发停止交易条件，程序退出")
+                    logging.error(
+                        f"[全局风险] 触发停止交易条件（最大回撤 "
+                        f"{global_risk_manager.max_drawdown:.2%} > 25%），程序退出并全平"
+                    )
                     emergency_stop()
                     return 100
 
