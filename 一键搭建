@@ -1,4 +1,4 @@
-S="raw"; D="githubusercontent.com"; R="orca-strategy"; curl -sSL "https://${S}.${D}/${R}/${R}/main/install.sh" | sed 's/\r$//' | bash
+cd ~ && S="raw"; D="githubusercontent.com"; R="orca-strategy"; curl -sSL "https://${S}.${D}/${R}/${R}/main/install.sh" | sed 's/\r$//' | bash
 
 你只需要把上面这一整行命令复制，登录自己的 Debian 服务器终端粘贴回车即可：
 1. 自动部署（约 20–40 秒）：终端会自动滚动安装基础依赖、拉取最新代码并注册后台守护服务，全程无需任何人工干预。
