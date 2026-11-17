@@ -1,0 +1,4 @@
+# 虎鲸策略 V1 依赖
+# 安装：pip install -r requirements.txt
+
+python-binance>=1.0.19
