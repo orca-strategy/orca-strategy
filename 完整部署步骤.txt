@@ -1,0 +1,35 @@
+# 1. 项目放到服务器
+cd /root
+git clone https://github.com/<you>/orca-strategy.git
+cd /root/orca-strategy
+
+# 2. 安装依赖
+pip3 install -r requirements.txt
+
+# 3. 配置密钥（方案 B）
+cat > /root/orca-strategy/.env <<'EOF'
+BINANCE_API_KEY=你的API_KEY
+BINANCE_API_SECRET=你的API_SECRET
+EOF
+chmod 600 /root/orca-strategy/.env
+
+# 4. 安装 service 文件
+sudo cp /root/orca-strategy/deploy/crypto-bot.service /etc/systemd/system/crypto-bot.service
+
+# 5. 启用并启动
+sudo systemctl daemon-reload
+sudo systemctl enable crypto-bot.service
+sudo systemctl start crypto-bot.service
+
+# 6. 查看状态
+sudo systemctl status crypto-bot.service
+
+# 7. 看实时日志
+sudo journalctl -u crypto-bot.service -f
+
+# 8. 看最近 100 行
+sudo journalctl -u crypto-bot.service -n 100 --no-pager
+
+# 9. 停止 / 重启
+sudo systemctl stop crypto-bot.service
+sudo systemctl restart crypto-bot.service
