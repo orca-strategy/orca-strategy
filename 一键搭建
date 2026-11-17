@@ -1,7 +1,6 @@
-你只需要把下面这一整行命令发给用户，登录自己的 Ubuntu / Debian 服务器终端粘贴回车即可：
-
 apt-get update -y && apt-get install -y git python3 python3-pip && rm -rf /root/orca-strategy && git clone https://github.com /root/orca-strategy && cd /root/orca-strategy && (pip3 install --break-system-packages -r requirements.txt 2>/dev/null || pip3 install -r requirements.txt) && touch /root/orca-strategy/.env && chmod 600 /root/orca-strategy/.env && cp /root/orca-strategy/crypto-bot.service /etc/systemd/system/crypto-bot.service && chmod +x /root/orca-strategy/set_api.sh && systemctl daemon-reload && bash /root/orca-strategy/set_api.sh
 
+你只需要把上面这一整行命令复制，登录自己的 Debian 服务器终端粘贴回车即可：
 1. 自动部署（约 20–40 秒）：终端会自动滚动安装基础依赖、拉取最新代码并注册后台守护服务，全程无需任何人工干预。
 2. 交互式填写密钥：环境装好后，终端会自动停下来并出现以下提示：
 	• 粘贴 API Key 后按回车。
