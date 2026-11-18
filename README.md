@@ -23,5 +23,6 @@
 
 * **常见报错与参数说明**：请参阅 **[常见问题解答](常见问题解答.txt)**
 * **一对一技术支持**：如需协助部署或调试，请参阅 **[付费代安装与技术部署服务](付费代安装与技术部署服务.txt)**
-* **视频教程与交流群**：前往 **[YouTube 视频教程](https://youtube.com)** ｜加入 **[Telegram 交流群](https://telegram.me)**
+* **视频教程与在线咨询**：前往 **[YouTube 视频教程](https://www.youtube.com/@orca-strategy)** ｜联系 **[Telegram 技术客服](https://t.me/orca_strategy)**
+
 
