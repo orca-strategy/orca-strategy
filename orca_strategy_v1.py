@@ -1,5 +1,5 @@
 # =============================================================================
-# 虎鲸策略 V1 (Orca Strategy V1)
+# 虎鲸策略 V1 (Orca Strategy V1) 
 # =============================================================================
 
 import time
@@ -8,6 +8,7 @@ import logging.handlers
 from binance.client import Client
 from binance.enums import ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL, ORDER_TYPE_LIMIT
 from binance import ThreadedWebsocketManager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import os
 import math
@@ -22,32 +23,38 @@ import json
 # 模块 1：日志与磁盘清理
 # =============================================================================
 
+log_file = 'multi_bot.log'
+LOG_FORMAT = '%(asctime)s - %(levelname)s - [%(symbol)s] - %(message)s'
+
+
+def _truncate_log(path, keep_lines):
+    """只保留日志最近 keep_lines 行；发生截断时返回原行数，否则返回 None"""
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    if len(lines) <= keep_lines:
+        return None
+    with open(path, 'w', encoding='utf-8') as f:
+        f.writelines(lines[-keep_lines:])
+    return len(lines)
+
+
 def cleanup_disk_space():
     """启动时清理过大的日志文件，防止磁盘占满"""
     try:
-        log_files = [
-            'multi_bot.log', 'multi_bot.log.1', 'multi_bot.log.2',
-            'multi_bot.log.3', 'multi_bot.log.4', 'multi_bot.log.5'
-        ]
-        for log_file in log_files:
-            if os.path.exists(log_file):
-                size = os.path.getsize(log_file)
-                if size > 10 * 1024 * 1024:
-                    print("清理大日志文件")
-                    with open(log_file, 'w') as f:
-                        f.write("日志文件已清理\n")
+        for name in [log_file] + [f"{log_file}.{i}" for i in range(1, 6)]:
+            if os.path.exists(name) and os.path.getsize(name) > 10 * 1024 * 1024:
+                print("清理大日志文件")
+                with open(name, 'w', encoding='utf-8') as f:
+                    f.write("日志文件已清理\n")
 
-        if os.path.exists('multi_bot.log'):
-            with open('multi_bot.log', 'r') as f:
-                lines = f.readlines()
-            if len(lines) > 300:
-                with open('multi_bot.log', 'w') as f:
-                    f.writelines(lines[-300:])
-                print(f"日志已截断，保留最近300行（原{len(lines)}行）")
-        return True
+        original = _truncate_log(log_file, 300)
+        if original is not None:
+            print(f"日志已截断，保留最近300行（原{original}行）")
     except Exception as e:
         print(f"磁盘清理失败: {e}")
-        return True
+    return True
 
 
 cleanup_disk_space()
@@ -63,16 +70,14 @@ class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
         try:
             super().emit(record)
         except UnicodeEncodeError:
-            record.msg = record.msg.encode('ascii', errors='replace').decode('ascii')
+            record.msg = record.getMessage().encode('ascii', errors='replace').decode('ascii')
+            record.args = ()
             super().emit(record)
         except OSError as e:
             if e.errno == 28:
                 print(f"[磁盘满] {record.getMessage()}")
             else:
                 raise
-
-
-log_file = 'multi_bot.log'
 
 
 class SymbolFormatter(logging.Formatter):
@@ -84,35 +89,27 @@ class SymbolFormatter(logging.Formatter):
         return super().format(record)
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(symbol)s] - %(message)s',
-    handlers=[
-        SafeRotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=1),
-        logging.StreamHandler()
-    ]
-)
-
-formatter = SymbolFormatter('%(asctime)s - %(levelname)s - [%(symbol)s] - %(message)s')
-for handler in logging.getLogger().handlers:
-    handler.setFormatter(formatter)
+_handlers = [
+    SafeRotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=1),
+    logging.StreamHandler()
+]
+_formatter = SymbolFormatter(LOG_FORMAT)
+for _h in _handlers:
+    _h.setFormatter(_formatter)
+logging.basicConfig(level=logging.INFO, handlers=_handlers)
 
 
 def periodic_log_cleanup():
-    """后台定期（每10小时）截断日志到最近300行"""
+    """后台定期（每10小时）截断日志到最近300行，并删除滚动备份"""
     while True:
         try:
-            if os.path.exists(log_file):
-                with open(log_file, 'r') as f:
-                    lines = f.readlines()
-                if len(lines) > 300:
-                    with open(log_file, 'w') as f:
-                        f.writelines(lines[-300:])
-                    logging.info(f"日志清理完成，保留最近300行（原{len(lines)}行）")
-                for i in range(1, 10):
-                    backup_file = f"{log_file}.{i}"
-                    if os.path.exists(backup_file):
-                        os.remove(backup_file)
+            original = _truncate_log(log_file, 300)
+            if original is not None:
+                logging.info(f"日志清理完成，保留最近300行（原{original}行）")
+            for i in range(1, 10):
+                backup_file = f"{log_file}.{i}"
+                if os.path.exists(backup_file):
+                    os.remove(backup_file)
         except Exception as e:
             print(f"定期日志清理失败: {e}")
         time.sleep(36000)
@@ -139,39 +136,20 @@ API_SECRET = os.getenv(
 #   注意：当前策略的止损/止盈/仓位/最小数量/轮询间隔在具体方法内部硬编码，
 #   以下配置项中仅 'leverage' 被 TradingBot 实际读取；
 #   其余字段作为配置意图保留，后续可逐步接入各策略方法。
+_DEFAULT_PAIR_CONFIG = {
+    'leverage': 10,
+    'stop_loss_pct': 0.078,
+    'take_profit_pct': 0.03,
+    'position_percentage': 0.02,
+    'min_position_qty': 0.001,
+    'price_check_interval': 2
+}
+
 TRADING_CONFIG = {
-    'HYPEUSDT': {
-        'leverage': 10,
-        'stop_loss_pct': 0.078,
-        'take_profit_pct': 0.03,
-        'position_percentage': 0.02,
-        'min_position_qty': 0.001,
-        'price_check_interval': 2
-    },
-    'XRPUSDT': {
-        'leverage': 10,
-        'stop_loss_pct': 0.078,
-        'take_profit_pct': 0.03,
-        'position_percentage': 0.02,
-        'min_position_qty': 0.001,
-        'price_check_interval': 2
-    },
-    'BNBUSDT': {
-        'leverage': 10,
-        'stop_loss_pct': 0.078,
-        'take_profit_pct': 0.03,
-        'position_percentage': 0.02,
-        'min_position_qty': 0.001,
-        'price_check_interval': 2
-    },
-    'SOLUSDT': {
-        'leverage': 10,
-        'stop_loss_pct': 0.065,
-        'take_profit_pct': 0.03,
-        'position_percentage': 0.02,
-        'min_position_qty': 0.001,
-        'price_check_interval': 2
-    }
+    'HYPEUSDT': dict(_DEFAULT_PAIR_CONFIG),
+    'XRPUSDT': dict(_DEFAULT_PAIR_CONFIG),
+    'BNBUSDT': dict(_DEFAULT_PAIR_CONFIG),
+    'SOLUSDT': dict(_DEFAULT_PAIR_CONFIG, stop_loss_pct=0.065),
 }
 
 TRADING_SYMBOLS = ['SOLUSDT']
@@ -216,7 +194,7 @@ class MarketSentimentAnalyzer:
             if len(klines) >= 12:
                 volumes = [float(k[5]) for k in klines]
                 current_volume = volumes[-1]
-                avg_volume = sum(volumes[-12:-1]) / 11 if len(volumes) > 11 else current_volume
+                avg_volume = sum(volumes[-12:-1]) / 11
                 return current_volume / avg_volume if avg_volume > 0 else 1.0
         except Exception as e:
             logging.error(f"[成交量比率获取失败] {symbol}: {e}")
@@ -225,40 +203,41 @@ class MarketSentimentAnalyzer:
     def analyze_sentiment(self, symbol):
         """综合情绪得分 [-1, 1]"""
         now = time.time()
-        if symbol in self.sentiment_cache and now - self.sentiment_cache[symbol]['timestamp'] < self.update_interval:
-            return self.sentiment_cache[symbol]['sentiment']
+        cached = self.sentiment_cache.get(symbol)
+        if cached and now - cached['timestamp'] < self.update_interval:
+            return cached['sentiment']
 
         try:
             funding_rate = self.get_funding_rate(symbol)
             volume_ratio = self.get_volume_ratio(symbol)
 
-            sentiment_score = 0.0
+            score = 0.0
 
             funding_weight = 0.4
             if funding_rate > 0.001:
-                sentiment_score += funding_weight
+                score += funding_weight
             elif funding_rate > 0.0005:
-                sentiment_score += funding_weight * 0.5
+                score += funding_weight * 0.5
             elif funding_rate < -0.001:
-                sentiment_score -= funding_weight
+                score -= funding_weight
             elif funding_rate < -0.0005:
-                sentiment_score -= funding_weight * 0.5
+                score -= funding_weight * 0.5
 
             volume_weight = 0.3
             if volume_ratio > 2.0:
-                sentiment_score += volume_weight * 0.5
+                score += volume_weight * 0.5
             elif volume_ratio < 0.5:
-                sentiment_score -= volume_weight * 0.3
+                score -= volume_weight * 0.3
 
-            sentiment_score = max(-1.0, min(1.0, sentiment_score))
+            score = max(-1.0, min(1.0, score))
 
             self.sentiment_cache[symbol] = {
                 'timestamp': now,
-                'sentiment': sentiment_score,
+                'sentiment': score,
                 'funding_rate': funding_rate,
                 'volume_ratio': volume_ratio
             }
-            return sentiment_score
+            return score
         except Exception as e:
             logging.error(f"[情绪分析失败] {symbol}: {e}")
             return 0.0
@@ -278,8 +257,7 @@ class MarketSentimentAnalyzer:
             return "BEARISH"
         elif score < -0.1:
             return "SLIGHTLY_BEARISH"
-        else:
-            return "NEUTRAL"
+        return "NEUTRAL"
 
 
 # =============================================================================
@@ -295,42 +273,40 @@ class CorrelationAnalyzer:
         self.max_history = 100
         self.update_interval = 300
         self.last_update = 0
+        self._lock = threading.Lock()
 
     def update_price(self, symbol, price):
-        if symbol not in self.price_history:
-            self.price_history[symbol] = []
-        self.price_history[symbol].append(price)
-        if len(self.price_history[symbol]) > self.max_history:
-            self.price_history[symbol].pop(0)
+        with self._lock:
+            history = self.price_history.setdefault(symbol, [])
+            history.append(price)
+            if len(history) > self.max_history:
+                history.pop(0)
+
+    @staticmethod
+    def _returns(prices):
+        return [(prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))]
 
     def calculate_correlation(self, symbol1, symbol2):
-        if symbol1 not in self.price_history or symbol2 not in self.price_history:
-            return 0.0
+        with self._lock:
+            if symbol1 not in self.price_history or symbol2 not in self.price_history:
+                return 0.0
+            prices1 = list(self.price_history[symbol1])
+            prices2 = list(self.price_history[symbol2])
 
-        prices1 = self.price_history[symbol1]
-        prices2 = self.price_history[symbol2]
         min_len = min(len(prices1), len(prices2))
         if min_len < 30:
             return 0.0
 
-        recent_prices1 = prices1[-min_len:]
-        recent_prices2 = prices2[-min_len:]
-
-        returns1, returns2 = [], []
-        for i in range(1, min_len):
-            ret1 = (recent_prices1[i] - recent_prices1[i - 1]) / recent_prices1[i - 1]
-            ret2 = (recent_prices2[i] - recent_prices2[i - 1]) / recent_prices2[i - 1]
-            returns1.append(ret1)
-            returns2.append(ret2)
-
-        if len(returns1) < 20:
-            return 0.0
-
         try:
+            returns1 = self._returns(prices1[-min_len:])
+            returns2 = self._returns(prices2[-min_len:])
+            if len(returns1) < 20:
+                return 0.0
+
             n = len(returns1)
             sum_x = sum(returns1)
             sum_y = sum(returns2)
-            sum_xy = sum(returns1[i] * returns2[i] for i in range(n))
+            sum_xy = sum(x * y for x, y in zip(returns1, returns2))
             sum_x2 = sum(x * x for x in returns1)
             sum_y2 = sum(y * y for y in returns2)
             numerator = n * sum_xy - sum_x * sum_y
@@ -346,7 +322,8 @@ class CorrelationAnalyzer:
         now = time.time()
         if now - self.last_update < self.update_interval:
             return
-        symbols = list(self.price_history.keys())
+        with self._lock:
+            symbols = list(self.price_history.keys())
         if len(symbols) < 2:
             return
         for i in range(len(symbols)):
@@ -364,9 +341,13 @@ class CorrelationAnalyzer:
 
 RISK_STATE_FILE = 'risk_state.json'
 
+# 峰值回撤熔断阈值。原版代码里判断用的是 0.45，但日志/注释写的是 25%，两处不一致；
+# 这里保持判断值 0.45 不变，并让日志与注释统一引用此常量。
+MAX_DRAWDOWN_LIMIT = 0.45
+
 
 class DynamicRiskManager:
-    """峰值回撤跟踪，回撤 > 25% 触发停止；状态持久化到 risk_state.json"""
+    """峰值回撤跟踪，回撤 > MAX_DRAWDOWN_LIMIT 触发停止；状态持久化到 risk_state.json"""
 
     def __init__(self):
         self.max_drawdown = 0.0
@@ -392,10 +373,7 @@ class DynamicRiskManager:
         try:
             with open(RISK_STATE_FILE, 'w') as f:
                 json.dump(
-                    {
-                        'max_drawdown': self.max_drawdown,
-                        'peak_balance': self.peak_balance
-                    },
+                    {'max_drawdown': self.max_drawdown, 'peak_balance': self.peak_balance},
                     f
                 )
         except Exception as e:
@@ -419,46 +397,157 @@ class DynamicRiskManager:
                 self._save_state()
 
     def should_stop_trading(self):
-        return self.max_drawdown > 0.45
+        return self.max_drawdown > MAX_DRAWDOWN_LIMIT
 
 
 # =============================================================================
 # 模块 6：全局 BTC 数据管理器（单例）
 # =============================================================================
+# 6.0 共用技术指标与趋势状态机
+#     原版里 EMA / MACD / RSI 各有两份实现，BTC趋势 / SPY趋势 / bot趋势
+#     是三份几乎一样的状态机，这里统一成一份，行为与原版一致。
+
+def calc_ema(data, window):
+    if not data:
+        return []
+    k = 2.0 / (window + 1)
+    values = [data[0]]
+    for i in range(1, len(data)):
+        values.append(data[i] * k + values[-1] * (1 - k))
+    return values
+
+
+def calc_macd(prices, fast=12, slow=26, signal=9):
+    """返回 (macd, signal, hist)；数据不足返回 (None, None, None)"""
+    if len(prices) < slow + signal:
+        return None, None, None
+    ema_fast = calc_ema(prices, fast)
+    ema_slow = calc_ema(prices, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = calc_ema(macd_line, signal)
+    if not signal_line:
+        return None, None, None
+    return macd_line[-1], signal_line[-1], macd_line[-1] - signal_line[-1]
+
+
+def calc_rsi(prices, period=9):
+    # 注意：保留原版行为——若前 period 根变化里没有任何下跌，直接返回 100（见文末疑点）
+    if len(prices) <= period:
+        return None
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    if avg_loss == 0:
+        return 100.0
+    rsi = 100 - (100 / (1 + avg_gain / avg_loss))
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsi = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
+    return rsi
+
+
+def calc_sma(prices, n):
+    if len(prices) < n:
+        return None
+    return sum(prices[-n:]) / n
+
+
+def new_trend_state():
+    return {"last": "DUAL", "pending": None, "confirm": 0,
+            "last_change_time": 0, "min_hold_time": 300}
+
+
+def evaluate_trend(prices, st, long_label, short_label, now=None):
+    """
+    趋势状态机（BTC趋势/SPY趋势共用）。
+    返回 long_label / short_label / 'DUAL'，并原地更新状态 st。
+    """
+    now = time.time() if now is None else now
+    if now - st["last_change_time"] < st["min_hold_time"]:
+        return st["last"]
+    if not prices or len(prices) < 90:      # MA90 至少需要 90 根
+        return st["last"]
+
+    close = prices[-1]
+    ma7 = calc_sma(prices, 7)
+    ma30 = calc_sma(prices, 30)
+    ma90 = calc_sma(prices, 90)
+    macd, signal, _ = calc_macd(prices)
+    if any(x is None for x in (ma7, ma30, ma90, macd, signal)):
+        return st["last"]
+
+    recent = prices[-10:]
+    low = min(recent)
+    amplitude = (max(recent) - low) / low if low > 0 else 0
+    rsi = calc_rsi(prices)
+    is_consolidation = (amplitude < 0.01 and rsi is not None and 40 <= rsi <= 60)
+
+    if is_consolidation:
+        strong_long = (ma7 > ma30 > ma90 and macd > signal and close > ma30 * 1.01 and macd > 0.01)
+        strong_short = (ma7 < ma30 < ma90 and macd < signal and close < ma30 * 0.99 and macd < -0.01)
+    else:
+        strong_long = (ma7 > ma30 > ma90 and macd > signal and close > ma30 and macd > 0)
+        strong_short = (ma7 < ma30 < ma90 and macd < signal and close < ma30 and macd < 0)
+    raw_mode = long_label if strong_long else (short_label if strong_short else "DUAL")
+
+    if is_consolidation and st["last"] != "DUAL":
+        if st["last"] == long_label and not (ma7 > ma30 and macd > signal):
+            raw_mode = "DUAL"
+        elif st["last"] == short_label and not (ma7 < ma30 and macd < signal):
+            raw_mode = "DUAL"
+
+    if raw_mode == st["last"]:
+        st["pending"], st["confirm"] = None, 0
+        return st["last"]
+
+    need = 3 if is_consolidation else 2
+    if raw_mode == st["pending"]:
+        st["confirm"] += 1
+    else:
+        st["pending"], st["confirm"] = raw_mode, 1
+
+    if raw_mode != "DUAL" and st["confirm"] >= need:
+        st["last"], st["pending"], st["confirm"] = raw_mode, None, 0
+        st["last_change_time"] = now
+    return st["last"]
+
 
 class GlobalBTCManager:
     """统一维护 BTC K线、趋势、2秒脉冲检测与 check_que 触发锁"""
 
     _instance = None
-    btc_3m_prices = []
-    last_update_time = 0
-    update_interval = 60
-    data_lock = threading.Lock()
-
-    btc_tick_history = []
-    btc_price_lock = threading.Lock()
+    _initialized = False
     MAX_HISTORY_SIZE = 200
-
-    btc_trend_mode = 'DUAL'
-    btc_trend_start_time = 0
-    btc_trend_lock = threading.Lock()
-    btc_trend_calc_state = {
-        "last": "DUAL",
-        "pending": None,
-        "confirm": 0,
-        "last_change_time": 0,
-        "min_hold_time": 300
-    }
-    last_trend_update = 0
-    trend_update_interval = 60
-
-    last_que_trigger_key = None
-    que_lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(GlobalBTCManager, cls).__new__(cls)
         return cls._instance
+
+    def __init__(self):
+        if GlobalBTCManager._initialized:
+            return
+        self.btc_3m_prices = []
+        self.last_update_time = 0
+        self.update_interval = 60
+        self.data_lock = threading.Lock()
+
+        self.btc_tick_history = []
+        self.btc_price_lock = threading.Lock()
+
+        self.btc_trend_mode = 'DUAL'
+        self.btc_trend_start_time = 0
+        self.btc_trend_lock = threading.Lock()
+        self.btc_trend_calc_state = new_trend_state()
+        self.last_trend_update = 0
+        self.trend_update_interval = 60
+
+        self.last_que_trigger_key = None
+        self.que_lock = threading.Lock()
+        GlobalBTCManager._initialized = True
 
     def update_btc_data(self):
         """每60秒刷新 BTC 3m K线收盘价"""
@@ -466,64 +555,27 @@ class GlobalBTCManager:
         if now - self.last_update_time < self.update_interval:
             return
         try:
+            klines_3m = client.futures_klines(
+                symbol=BTC_SYMBOL,
+                interval=Client.KLINE_INTERVAL_3MINUTE,
+                limit=120
+            )
             with self.data_lock:
-                klines_3m = client.futures_klines(
-                    symbol=BTC_SYMBOL,
-                    interval=Client.KLINE_INTERVAL_3MINUTE,
-                    limit=120
-                )
                 self.btc_3m_prices = [float(x[4]) for x in klines_3m]
                 self.last_update_time = now
         except Exception as e:
             logging.error(f"[全局BTC数据] 更新失败: {e}")
 
+    # 兼容原方法名
     def _calc_ema(self, data, window):
-        if not data:
-            return []
-        k = 2.0 / (window + 1)
-        ema_values = [data[0]]
-        for i in range(1, len(data)):
-            ema_values.append(data[i] * k + ema_values[-1] * (1 - k))
-        return ema_values
+        return calc_ema(data, window)
 
     def _calc_macd(self, prices, fast=12, slow=26, signal=9):
-        if len(prices) < slow + signal:
-            return None, None
-        ema_fast = self._calc_ema(prices, fast)
-        ema_slow = self._calc_ema(prices, slow)
-        if len(ema_fast) != len(ema_slow):
-            min_len = min(len(ema_fast), len(ema_slow))
-            ema_fast = ema_fast[-min_len:]
-            ema_slow = ema_slow[-min_len:]
-        macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
-        signal_line = self._calc_ema(macd_line, signal) if macd_line else []
-        if not signal_line:
-            return None, None
-        return macd_line[-1], signal_line[-1]
+        macd, sig, _ = calc_macd(prices, fast, slow, signal)
+        return macd, sig
 
     def _calc_rsi(self, prices, period=9):
-        if len(prices) <= period:
-            return None
-        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-        gains = [d if d > 0 else 0 for d in deltas]
-        losses = [-d if d < 0 else 0 for d in deltas]
-        avg_gain = sum(gains[:period]) / period
-        avg_loss = sum(losses[:period]) / period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        for i in range(period, len(deltas)):
-            gain = gains[i] if i < len(gains) else 0
-            loss = losses[i] if i < len(losses) else 0
-            avg_gain = (avg_gain * (period - 1) + gain) / period
-            avg_loss = (avg_loss * (period - 1) + loss) / period
-            if avg_loss == 0:
-                rsi = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
-        return rsi
+        return calc_rsi(prices, period)
 
     def update_btc_trend(self):
         """独立计算 BTC 趋势，单一来源写入供 check_que 使用"""
@@ -532,64 +584,12 @@ class GlobalBTCManager:
             return
         self.last_trend_update = now
 
-        with self.data_lock:
-            prices = list(self.btc_3m_prices)
+        prices = self.get_btc_3m_prices()
         if len(prices) < 90:
             return
 
-        st = self.btc_trend_calc_state
-        if now - st["last_change_time"] < st["min_hold_time"]:
-            return
-
-        close = prices[-1]
-        ma7 = sum(prices[-7:]) / 7
-        ma30 = sum(prices[-30:]) / 30
-        ma90 = sum(prices[-90:]) / 90
-        macd_val, signal_val = self._calc_macd(prices)
-        if macd_val is None or signal_val is None:
-            return
-
-        recent = prices[-10:]
-        amplitude = (max(recent) - min(recent)) / min(recent) if min(recent) > 0 else 0
-        rsi = self._calc_rsi(prices)
-        is_consolidation = (amplitude < 0.01 and rsi is not None and 40 <= rsi <= 60)
-
-        if is_consolidation:
-            strong_long = (ma7 > ma30 > ma90 and macd_val > signal_val
-                           and close > ma30 * 1.01 and macd_val > 0.01)
-            strong_short = (ma7 < ma30 < ma90 and macd_val < signal_val
-                            and close < ma30 * 0.99 and macd_val < -0.01)
-        else:
-            strong_long = (ma7 > ma30 > ma90 and macd_val > signal_val
-                           and close > ma30 and macd_val > 0)
-            strong_short = (ma7 < ma30 < ma90 and macd_val < signal_val
-                            and close < ma30 and macd_val < 0)
-
-        raw_mode = "LONG_ONLY" if strong_long else ("SHORT_ONLY" if strong_short else "DUAL")
-
-        if is_consolidation and st["last"] != "DUAL":
-            if st["last"] == "LONG_ONLY" and not (ma7 > ma30 and macd_val > signal_val):
-                raw_mode = "DUAL"
-            elif st["last"] == "SHORT_ONLY" and not (ma7 < ma30 and macd_val < signal_val):
-                raw_mode = "DUAL"
-
-        if raw_mode == st["last"]:
-            st["pending"], st["confirm"] = None, 0
-            new_mode = st["last"]
-        else:
-            N = 3 if is_consolidation else 2
-            if raw_mode == st["pending"]:
-                st["confirm"] += 1
-            else:
-                st["pending"], st["confirm"] = raw_mode, 1
-
-            if raw_mode != "DUAL" and st["confirm"] >= N:
-                st["last"] = raw_mode
-                st["pending"], st["confirm"] = None, 0
-                st["last_change_time"] = now
-                new_mode = raw_mode
-            else:
-                new_mode = st["last"]
+        new_mode = evaluate_trend(prices, self.btc_trend_calc_state,
+                                  "LONG_ONLY", "SHORT_ONLY", now)
 
         with self.btc_trend_lock:
             if new_mode != self.btc_trend_mode:
@@ -632,30 +632,23 @@ class GlobalBTCManager:
         """检测2秒内 BTC 涨跌幅 ≥ 0.18%"""
         with self.btc_price_lock:
             now = time.time()
-            recent_ticks = [(t, p) for t, p in self.btc_tick_history if now - t <= 10]
-            if len(recent_ticks) < 2:
-                return None
-            two_sec_ticks = [(t, p) for t, p in recent_ticks if now - t <= 2]
+            two_sec_ticks = [(t, p) for t, p in self.btc_tick_history if now - t <= 2]
             if len(two_sec_ticks) < 2:
                 return None
 
             prices = [p for _, p in two_sec_ticks]
-            max_price = max(prices)
-            min_price = min(prices)
             base_price = two_sec_ticks[0][1]
             if base_price <= 0:
                 return None
 
-            diff_pct = (max_price - min_price) / base_price
+            diff_pct = (max(prices) - min(prices)) / base_price
             if diff_pct >= 0.0018:
-                first_price = two_sec_ticks[0][1]
-                last_price = two_sec_ticks[-1][1]
-                return 'SPIKE_UP' if last_price > first_price else 'SPIKE_DOWN'
+                return 'SPIKE_UP' if two_sec_ticks[-1][1] > two_sec_ticks[0][1] else 'SPIKE_DOWN'
             return None
 
     def get_btc_3m_prices(self):
         with self.data_lock:
-            return self.btc_3m_prices.copy() if self.btc_3m_prices else []
+            return list(self.btc_3m_prices)
 
 
 # =============================================================================
@@ -674,19 +667,20 @@ class GlobalSPYManager:
         return cls._instance
 
     def __init__(self):
-        if not GlobalSPYManager._initialized:
-            self.spy_1m_prices = []
-            self.spy_1m_volumes = []
-            self.spy_avg_volume = None
-            self.last_kline_update = 0
-            self.kline_update_interval = 60
-            self.data_lock = threading.Lock()
+        if GlobalSPYManager._initialized:
+            return
+        self.spy_1m_prices = []
+        self.spy_1m_volumes = []
+        self.spy_avg_volume = None
+        self.last_kline_update = 0
+        self.kline_update_interval = 60
+        self.data_lock = threading.Lock()
 
-            self.spy_3m_closes = []
-            self.last_3m_update = 0
-            self.kline_3m_update_interval = 60
+        self.spy_3m_closes = []
+        self.last_3m_update = 0
+        self.kline_3m_update_interval = 60
 
-            GlobalSPYManager._initialized = True
+        GlobalSPYManager._initialized = True
 
     def update_spy_1m_data(self):
         now = time.time()
@@ -703,13 +697,8 @@ class GlobalSPYManager:
             with self.data_lock:
                 self.spy_1m_prices = [float(k[4]) for k in klines]
                 self.spy_1m_volumes = [float(k[5]) for k in klines]
-                if len(self.spy_1m_volumes) >= 20:
-                    self.spy_avg_volume = sum(self.spy_1m_volumes[-20:]) / 20
-                else:
-                    self.spy_avg_volume = (
-                        sum(self.spy_1m_volumes) / len(self.spy_1m_volumes)
-                        if self.spy_1m_volumes else None
-                    )
+                window = self.spy_1m_volumes[-20:]
+                self.spy_avg_volume = sum(window) / len(window) if window else None
                 self.last_kline_update = now
         except Exception as e:
             logging.error(f"[SPY K线更新] 失败: {e}")
@@ -718,19 +707,18 @@ class GlobalSPYManager:
         """1m 涨跌幅 ≥ 0.06% 且成交量 ≥ 3 倍均值 → 强信号"""
         self.update_spy_1m_data()
         with self.data_lock:
-            if len(self.spy_1m_prices) < 2 or self.spy_avg_volume is None or self.spy_avg_volume <= 0:
+            if len(self.spy_1m_prices) < 2 or not self.spy_avg_volume or self.spy_avg_volume <= 0:
                 logging.debug("[SPY信号] 数据不足，跳过")
                 return None
             price_change_pct = (
                 (self.spy_1m_prices[-1] - self.spy_1m_prices[-2]) / self.spy_1m_prices[-2]
             )
             current_volume = self.spy_1m_volumes[-1] if self.spy_1m_volumes else 0
-            volume_ratio = current_volume / self.spy_avg_volume if self.spy_avg_volume else 0
-            volume_surge = volume_ratio >= 3.0
+            volume_surge = (current_volume / self.spy_avg_volume) >= 3.0
 
             if price_change_pct >= 0.0006 and volume_surge:
                 return 'STRONG_UP'
-            elif price_change_pct <= -0.0006 and volume_surge:
+            if price_change_pct <= -0.0006 and volume_surge:
                 return 'STRONG_DOWN'
             return None
 
@@ -754,7 +742,7 @@ class GlobalSPYManager:
 
     def get_spy_3m_closes(self):
         with self.data_lock:
-            return self.spy_3m_closes.copy() if self.spy_3m_closes else []
+            return list(self.spy_3m_closes)
 
 
 global_btc_manager = GlobalBTCManager()
@@ -809,36 +797,45 @@ class TradingBot:
         self.logger = SymbolLogger(symbol)
         self.leverage = self.config['leverage']
 
-        self.current_position = {
-            "LONG": {
-                "entry_price": None, "quantity": 0, "margin": 0,
-                "stop_price": None, "take_profit_price": None,
-                "stop_updated": False, "open_time": None
-            },
-            "SHORT": {
-                "entry_price": None, "quantity": 0, "margin": 0,
-                "stop_price": None, "take_profit_price": None,
-                "stop_updated": False, "open_time": None
-            }
-        }
+        self.current_position = {side: self._empty_position() for side in ('LONG', 'SHORT')}
+        self._pos_lock = threading.RLock()
 
         self.last_clear_time = {"LONG": None, "SHORT": None}
         self.ban_period = 18 * 60
 
         self.market_data = {"price": None}
         self.trend_mode = 'DUAL'
+        self._trend_state = new_trend_state()
+        self._spy_trend_state = new_trend_state()
+        self._spy_trend_mode = 'DUAL'
 
         self.active_trading = False
-        self._last_spy_signal_time = 0
-        self._last_fen_check = 0
         self._delayed_timers = {}
         self._close_timer = {}
         self._close_pending = {'LONG': False, 'SHORT': False}
+
+        self._last_spy_signal_time = 0
+        self._last_fen_check = 0
+        self._last_qiang_time = 0
         self._last_jia_check = 0
-        self._spy_trend_mode = None
         self._last_jia_trigger = 0
         self._jia_ban_period = 30 * 60
+        self._last_he_check = 0
         self._last_que_check = 0
+        self._last_xau_spy_trend = None
+        self._sentiment_trigger_key = None
+
+        self._bal_time = 0
+        self._bal_value = 0
+        self._filters = None          # 交易所规则缓存
+
+    @staticmethod
+    def _empty_position():
+        return {
+            "entry_price": None, "quantity": 0, "margin": 0,
+            "stop_price": None, "take_profit_price": None,
+            "stop_updated": False, "open_time": None
+        }
 
     def initialize(self):
         try:
@@ -866,221 +863,51 @@ class TradingBot:
         except Exception as e:
             self.logger.error(f"WebSocket异常: {e}, 消息: {msg}")
 
-    # ===== 技术指标 =====
+    # ===== 技术指标（委托给模块6的共用实现，保留原方法名）=====
 
     def calculate_rsi(self, prices, period=9):
-        if len(prices) <= period:
-            return None
-        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-        gains = [d if d > 0 else 0 for d in deltas]
-        losses = [-d if d < 0 else 0 for d in deltas]
-        avg_gain = sum(gains[:period]) / period
-        avg_loss = sum(losses[:period]) / period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        for i in range(period, len(deltas)):
-            gain = gains[i] if i < len(gains) else 0
-            loss = losses[i] if i < len(losses) else 0
-            avg_gain = (avg_gain * (period - 1) + gain) / period
-            avg_loss = (avg_loss * (period - 1) + loss) / period
-            if avg_loss == 0:
-                rsi = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
-        return rsi
+        return calc_rsi(prices, period)
 
     def get_ma(self, prices, n):
-        if len(prices) < n:
-            return None
-        return sum(prices[-n:]) / n
-
-    def get_ma_signal(self, prices, short_window=10, long_window=30, min_ma_diff_pct=0.0005):
-        if len(prices) < max(long_window + 1, 50):
-            return 'NONE'
-
-        ma_short_prev = self.get_ma(prices[:-1], short_window)
-        ma_long_prev = self.get_ma(prices[:-1], long_window)
-        ma_short_now = self.get_ma(prices, short_window)
-        ma_long_now = self.get_ma(prices, long_window)
-
-        if None in [ma_short_prev, ma_long_prev, ma_short_now, ma_long_now]:
-            return 'NONE'
-
-        ma_cross_up = ma_short_prev < ma_long_prev and ma_short_now > ma_long_now
-        ma_cross_down = ma_short_prev > ma_long_prev and ma_short_now < ma_long_now
-        ma_distance_ok = abs(ma_short_now - ma_long_now) / ma_long_now >= min_ma_diff_pct
-
-        macd, signal, _ = self.calculate_macd(prices)
-        if macd is None or signal is None:
-            return 'NONE'
-
-        if ma_cross_up and ma_distance_ok and macd > signal:
-            return 'UP'
-        elif ma_cross_down and ma_distance_ok and macd < signal:
-            return 'DOWN'
-        elif macd > signal:
-            return 'UP'
-        elif macd < signal:
-            return 'DOWN'
-        return 'NONE'
+        return calc_sma(prices, n)
 
     def calculate_macd(self, prices, fast=12, slow=26, signal=9):
-        if len(prices) < slow + signal:
-            return None, None, None
-
-        def ema(data, window):
-            if not data:
-                return []
-            k = 2.0 / (window + 1)
-            ema_values = [data[0]]
-            for i in range(1, len(data)):
-                ema_values.append(data[i] * k + ema_values[-1] * (1 - k))
-            return ema_values
-
-        ema_fast = ema(prices, fast)
-        ema_slow = ema(prices, slow)
-        if len(ema_fast) != len(ema_slow):
-            min_len = min(len(ema_fast), len(ema_slow))
-            ema_fast = ema_fast[-min_len:]
-            ema_slow = ema_slow[-min_len:]
-
-        macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
-        signal_line = ema(macd_line, signal) if macd_line else []
-        hist = [m - s for m, s in zip(macd_line[-len(signal_line):], signal_line)] if signal_line else []
-
-        return (
-            macd_line[-1] if macd_line else None,
-            signal_line[-1] if signal_line else None,
-            hist[-1] if hist else None
-        )
+        return calc_macd(prices, fast, slow, signal)
 
     def calculate_rsi_safe(self, prices, period=9, min_data_length=10):
         if len(prices) < min_data_length:
             return None
-        return self.calculate_rsi(prices, period)
+        return calc_rsi(prices, period)
+
+    def get_ma_signal(self, prices, short_window=10, long_window=30, min_ma_diff_pct=0.0005):
+        """
+        MACD 方向信号。
+        原版里的"MA 金叉/死叉 + 距离"分支与后面的 macd>signal / macd<signal
+        分支结果完全相同（无论是否金叉都落到同一个结果），因此简化为只看 MACD。
+        short_window / long_window / min_ma_diff_pct 参数保留仅为接口兼容。
+        """
+        if len(prices) < max(long_window + 1, 50):
+            return 'NONE'
+        macd, signal, _ = calc_macd(prices)
+        if macd is None or signal is None:
+            return 'NONE'
+        if macd > signal:
+            return 'UP'
+        if macd < signal:
+            return 'DOWN'
+        return 'NONE'
 
     # ===== 趋势判断 =====
 
     def get_trend_mode(self):
         """BTC 趋势模式（LONG_ONLY / SHORT_ONLY / DUAL），每 bot 独立延迟确认"""
-        if not hasattr(self, "_trend_state"):
-            self._trend_state = {
-                "last": "DUAL", "pending": None, "confirm": 0,
-                "last_change_time": 0, "min_hold_time": 300
-            }
-        st = self._trend_state
-        now = time.time()
-        if now - st["last_change_time"] < st["min_hold_time"]:
-            return st["last"]
-
-        btc_3m_prices = global_btc_manager.get_btc_3m_prices()
-        if not btc_3m_prices or len(btc_3m_prices) < 50:
-            return st["last"]
-
-        close = btc_3m_prices[-1]
-        ma7 = self.get_ma(btc_3m_prices, 7)
-        ma30 = self.get_ma(btc_3m_prices, 30)
-        ma90 = self.get_ma(btc_3m_prices, 90)
-        macd, signal, _ = self.calculate_macd(btc_3m_prices)
-        if any(x is None for x in (ma7, ma30, ma90, macd, signal)):
-            return st["last"]
-
-        recent_prices = btc_3m_prices[-10:]
-        amplitude = (max(recent_prices) - min(recent_prices)) / min(recent_prices) if min(recent_prices) > 0 else 0
-        rsi = self.calculate_rsi_safe(btc_3m_prices)
-        is_consolidation = (amplitude < 0.01 and rsi is not None and 40 <= rsi <= 60)
-
-        if is_consolidation:
-            strong_long = (ma7 > ma30 > ma90 and macd > signal and close > ma30 * 1.01 and macd > 0.01)
-            strong_short = (ma7 < ma30 < ma90 and macd < signal and close < ma30 * 0.99 and macd < -0.01)
-        else:
-            strong_long = (ma7 > ma30 > ma90 and macd > signal and close > ma30 and macd > 0)
-            strong_short = (ma7 < ma30 < ma90 and macd < signal and close < ma30 and macd < 0)
-        raw_mode = "LONG_ONLY" if strong_long else ("SHORT_ONLY" if strong_short else "DUAL")
-
-        if is_consolidation and st["last"] != "DUAL":
-            if st["last"] == "LONG_ONLY" and not (ma7 > ma30 and macd > signal):
-                raw_mode = "DUAL"
-            elif st["last"] == "SHORT_ONLY" and not (ma7 < ma30 and macd < signal):
-                raw_mode = "DUAL"
-
-        if raw_mode == st["last"]:
-            st["pending"], st["confirm"] = None, 0
-            return st["last"]
-
-        N = 3 if is_consolidation else 2
-        if raw_mode == st["pending"]:
-            st["confirm"] += 1
-        else:
-            st["pending"], st["confirm"] = raw_mode, 1
-
-        if raw_mode != "DUAL" and st["confirm"] >= N:
-            st["last"], st["pending"], st["confirm"] = raw_mode, None, 0
-            st["last_change_time"] = now
-            return st["last"]
-        return st["last"]
+        return evaluate_trend(global_btc_manager.get_btc_3m_prices(),
+                              self._trend_state, "LONG_ONLY", "SHORT_ONLY")
 
     def get_spy_trend_mode(self):
         """SPY 趋势模式（LONG_SPY / SHORT_SPY / DUAL）"""
-        if not hasattr(self, "_spy_trend_state"):
-            self._spy_trend_state = {
-                "last": "DUAL", "pending": None, "confirm": 0,
-                "last_change_time": 0, "min_hold_time": 300
-            }
-        st = self._spy_trend_state
-        now = time.time()
-        if now - st["last_change_time"] < st["min_hold_time"]:
-            return st["last"]
-
-        spy_3m = global_spy_manager.get_spy_3m_closes()
-        if not spy_3m or len(spy_3m) < 50:
-            return st["last"]
-
-        close = spy_3m[-1]
-        ma7 = self.get_ma(spy_3m, 7)
-        ma30 = self.get_ma(spy_3m, 30)
-        ma90 = self.get_ma(spy_3m, 90)
-        macd, signal, _ = self.calculate_macd(spy_3m)
-        if any(x is None for x in (ma7, ma30, ma90, macd, signal)):
-            return st["last"]
-
-        recent = spy_3m[-10:]
-        amplitude = (max(recent) - min(recent)) / min(recent) if min(recent) > 0 else 0
-        rsi = self.calculate_rsi_safe(spy_3m)
-        is_consolidation = (amplitude < 0.01 and rsi is not None and 40 <= rsi <= 60)
-
-        if is_consolidation:
-            strong_long = (ma7 > ma30 > ma90 and macd > signal and close > ma30 * 1.01 and macd > 0.01)
-            strong_short = (ma7 < ma30 < ma90 and macd < signal and close < ma30 * 0.99 and macd < -0.01)
-        else:
-            strong_long = (ma7 > ma30 > ma90 and macd > signal and close > ma30 and macd > 0)
-            strong_short = (ma7 < ma30 < ma90 and macd < signal and close < ma30 and macd < 0)
-        raw_mode = "LONG_SPY" if strong_long else ("SHORT_SPY" if strong_short else "DUAL")
-
-        if is_consolidation and st["last"] != "DUAL":
-            if st["last"] == "LONG_SPY" and not (ma7 > ma30 and macd > signal):
-                raw_mode = "DUAL"
-            elif st["last"] == "SHORT_SPY" and not (ma7 < ma30 and macd < signal):
-                raw_mode = "DUAL"
-
-        if raw_mode == st["last"]:
-            st["pending"], st["confirm"] = None, 0
-            return st["last"]
-
-        N = 3 if is_consolidation else 2
-        if raw_mode == st["pending"]:
-            st["confirm"] += 1
-        else:
-            st["pending"], st["confirm"] = raw_mode, 1
-
-        if raw_mode != "DUAL" and st["confirm"] >= N:
-            st["last"], st["pending"], st["confirm"] = raw_mode, None, 0
-            st["last_change_time"] = now
-            return st["last"]
-        return st["last"]
+        return evaluate_trend(global_spy_manager.get_spy_3m_closes(),
+                              self._spy_trend_state, "LONG_SPY", "SHORT_SPY")
 
     # ===== 增强策略主入口 =====
 
@@ -1099,7 +926,7 @@ class TradingBot:
                 elif self.trend_mode == 'SHORT_ONLY':
                     self.close_position_by_ban('LONG')
 
-            previous_spy_trend = getattr(self, '_spy_trend_mode', 'DUAL')
+            previous_spy_trend = self._spy_trend_mode
             self._spy_trend_mode = self.get_spy_trend_mode()
             if self._spy_trend_mode != previous_spy_trend:
                 self.logger.info(f"[SPY趋势切换] 从 {previous_spy_trend} 切换到 {self._spy_trend_mode}")
@@ -1108,7 +935,7 @@ class TradingBot:
                 elif self._spy_trend_mode == 'SHORT_SPY':
                     self.close_position_by_ban('LONG')
 
-            for side in ['LONG', 'SHORT']:
+            for side in ('LONG', 'SHORT'):
                 self.check_stop_conditions(side)
 
             if self.active_trading:
@@ -1129,7 +956,7 @@ class TradingBot:
                         self._last_spy_signal_time = now
                         if spy_signal == 'STRONG_UP':
                             self.handle_spy_up_for_all(trading_bots)
-                        elif spy_signal == 'STRONG_DOWN':
+                        else:
                             self.handle_spy_down_for_all(trading_bots)
 
                 self.check_fen(trading_bots)
@@ -1137,12 +964,10 @@ class TradingBot:
                 self.check_jia(trading_bots)
                 self.check_he(trading_bots)
                 self.check_xau(trading_bots)
-                self.check_que()
-                self.update_performance()
-            else:
-                # 助理 bot 仍参与 check_que（让 XRP bot 能驱动加仓）
-                self.check_que()
-                self.update_performance()
+
+            # 助理 bot 同样参与 check_que（让 XRP bot 能驱动加仓）
+            self.check_que()
+            self.update_performance()
 
         except Exception as e:
             self.logger.error(f"[增强策略异常] {e}")
@@ -1158,8 +983,7 @@ class TradingBot:
 
     def handle_btc_spike_up_for_all(self, all_bots):
         """BTC 2秒暴涨：所有交易对平空仓，HYPE 开多仓0.04"""
-        btc_3m_prices = global_btc_manager.get_btc_3m_prices()
-        btc_trend = self.get_ma_signal(btc_3m_prices)
+        btc_trend = self.get_ma_signal(global_btc_manager.get_btc_3m_prices())
         if btc_trend != 'DOWN':
             for bot in all_bots:
                 bot.close_position_by_ban('SHORT')
@@ -1169,8 +993,7 @@ class TradingBot:
 
     def handle_btc_spike_down_for_all(self, all_bots):
         """BTC 2秒暴跌：所有交易对平多仓，HYPE 开空仓0.04"""
-        btc_3m_prices = global_btc_manager.get_btc_3m_prices()
-        btc_trend = self.get_ma_signal(btc_3m_prices)
+        btc_trend = self.get_ma_signal(global_btc_manager.get_btc_3m_prices())
         if btc_trend != 'UP':
             for bot in all_bots:
                 bot.close_position_by_ban('LONG')
@@ -1195,7 +1018,7 @@ class TradingBot:
                 self.logger.info("SPY强势下跌：对所有交易对-平多仓-SOL开空")
 
     def check_fen(self, all_bots):
-        """BTC 1m 分型：形态+放量3~8倍开同向；>8倍极端放量延时反向"""
+        """BTC 1m 分型：形态+放量3~8倍开同向；>8倍极端放量只减仓同向50%"""
         now = time.time()
         if now - self._last_fen_check < 60:
             return
@@ -1212,11 +1035,10 @@ class TradingBot:
             closes = [float(k[4]) for k in klines_1m]
             volumes = [float(k[5]) for k in klines_1m]
 
-            current_volume = volumes[-1]
-            avg_volume = sum(volumes[:-1]) / (len(volumes) - 1) if len(volumes) > 1 else 0
+            avg_volume = sum(volumes[:-1]) / (len(volumes) - 1)
             if avg_volume <= 0:
                 return
-            volume_ratio = current_volume / avg_volume
+            volume_ratio = volumes[-1] / avg_volume
 
             close = closes[-1]
             ma7 = sum(closes[-7:]) / 7
@@ -1230,15 +1052,15 @@ class TradingBot:
             down_condition = (close < ma7 < ma30 and macd < signal and hist < 0
                               and volume_ratio > 3.0 and close <= min(closes[-10:]))
 
-            active_bots = [bot for bot in all_bots if bot.active_trading]
-            if not active_bots:
+            if not any(bot.active_trading for bot in all_bots):
                 return
 
             if up_condition:
                 self._last_fen_check = now
                 if volume_ratio > 8.0:
+                    # 原版日志写"延时开空"，实际只执行了减多头50%（行为保留，日志改为真实动作）
                     self.close('LONG')
-                    self.logger.info(f"[up极端放量] BTC放量{volume_ratio:.1f}倍（>8倍），延时开空")
+                    self.logger.info(f"[up极端放量] BTC放量{volume_ratio:.1f}倍（>8倍），减多头50%")
                 else:
                     self.logger.info(f"[check_fen] BTC上涨形态触发，放量{volume_ratio:.1f}倍（3~8倍），开多")
                     self.close_position_by_ban('SHORT')
@@ -1248,7 +1070,7 @@ class TradingBot:
                 self._last_fen_check = now
                 if volume_ratio > 8.0:
                     self.close('SHORT')
-                    self.logger.info(f"[down极端放量] BTC放量{volume_ratio:.1f}倍（>8倍），延时开多")
+                    self.logger.info(f"[down极端放量] BTC放量{volume_ratio:.1f}倍（>8倍），减空头50%")
                 else:
                     self.logger.info(f"[check_fen] BTC下跌形态触发，放量{volume_ratio:.1f}倍（3~8倍），开空")
                     self.close_position_by_ban('LONG')
@@ -1277,8 +1099,7 @@ class TradingBot:
 
             current_price = None
             try:
-                ticker = client.futures_symbol_ticker(symbol=BTC_SYMBOL)
-                current_price = float(ticker['price'])
+                current_price = float(client.futures_symbol_ticker(symbol=BTC_SYMBOL)['price'])
             except Exception as e:
                 self.logger.warning(f"[BTC 30日突破] 获取BTC实时价格失败: {e}")
             if not current_price or current_price <= 0:
@@ -1287,15 +1108,14 @@ class TradingBot:
             if current_price > high_30:
                 self.logger.debug(f"[BTC 30日突破] 新高 current={current_price:.2f} > 30dHigh={high_30:.2f}")
                 return 'NEW_HIGH'
-            elif current_price < low_30:
+            if current_price < low_30:
                 self.logger.debug(f"[BTC 30日突破] 新低 current={current_price:.2f} < 30dLow={low_30:.2f}")
                 return 'NEW_LOW'
-            else:
-                self.logger.debug(
-                    f"[BTC 30日突破] 未突破 current={current_price:.2f} "
-                    f"(30dHigh={high_30:.2f}, 30dLow={low_30:.2f})"
-                )
-                return 'NONE'
+            self.logger.debug(
+                f"[BTC 30日突破] 未突破 current={current_price:.2f} "
+                f"(30dHigh={high_30:.2f}, 30dLow={low_30:.2f})"
+            )
+            return 'NONE'
         except Exception as e:
             self.logger.error(f"[BTC 30日突破] 计算失败: {e}")
             return 'NONE'
@@ -1303,7 +1123,7 @@ class TradingBot:
     def check_qiang(self, all_bots):
         """BTC 15m 强势突破 + 8倍放量紧急开仓；XRP 需 BTC 30日新高/新低过滤"""
         now = time.time()
-        if now - getattr(self, '_last_qiang_time', 0) < 60:
+        if now - self._last_qiang_time < 60:
             return
         self._last_qiang_time = now
 
@@ -1322,7 +1142,7 @@ class TradingBot:
             ma7_15 = sum(closes_15[-7:]) / 7
             ma30_15 = sum(closes_15[-30:]) / 30
             macd, signal, _ = self.calculate_macd(closes_15)
-            if None in (ma7_15, ma30_15, macd, signal):
+            if macd is None or signal is None:
                 return
 
             klines_3m = client.futures_klines(
@@ -1335,11 +1155,10 @@ class TradingBot:
                 return
 
             volumes_3m = [float(k[5]) for k in klines_3m]
-            current_vol = volumes_3m[-1]
             avg_vol = sum(volumes_3m[-21:-1]) / 20
             if avg_vol <= 0:
                 return
-            vol_ratio = current_vol / avg_vol
+            vol_ratio = volumes_3m[-1] / avg_vol
 
             up_condition = (close > ma7_15 > ma30_15 and macd > signal
                             and close >= max(closes_15[-10:]) and vol_ratio >= 8)
@@ -1347,38 +1166,34 @@ class TradingBot:
                               and close <= min(closes_15[-10:]) and vol_ratio >= 8)
 
             btc_30d = self.get_btc_30d_breakout()
-            allow_long = (btc_30d == 'NEW_HIGH')
-            allow_short = (btc_30d == 'NEW_LOW')
 
             if up_condition:
                 self.logger.info(
                     f"[check_qiang] 强势上涨触发（15分钟突破，放量{vol_ratio:.1f}倍），"
                     f"BTC 30日状态={btc_30d}"
                 )
+                allow_long = (btc_30d == 'NEW_HIGH')
                 if not allow_long:
                     self.logger.info("[check_qiang] BTC未创30日新高，XRP不开多；执行平空")
                 for bot in all_bots:
                     bot.close('SHORT')
                     if bot.symbol == 'BNBUSDT':
                         bot.execute_open_order('LONG', 0.02)
-                    if not allow_long:
-                        continue
-                    if bot.symbol == 'XRPUSDT':
+                    if allow_long and bot.symbol == 'XRPUSDT':
                         bot.execute_open_order('LONG', 0.04)
             elif down_condition:
                 self.logger.info(
                     f"[check_qiang] 强势下跌触发（15分钟跌破，放量{vol_ratio:.1f}倍），"
                     f"BTC 30日状态={btc_30d}"
                 )
+                allow_short = (btc_30d == 'NEW_LOW')
                 if not allow_short:
                     self.logger.info("[check_qiang] BTC未创30日新低，XRP不开空；执行平多")
                 for bot in all_bots:
                     bot.close('LONG')
                     if bot.symbol == 'BNBUSDT':
                         bot.execute_open_order('SHORT', 0.02)
-                    if not allow_short:
-                        continue
-                    if bot.symbol == 'XRPUSDT':
+                    if allow_short and bot.symbol == 'XRPUSDT':
                         bot.execute_open_order('SHORT', 0.04)
             else:
                 self.logger.debug(f"[check_qiang] 未触发：vol_ratio={vol_ratio:.2f}, close={close:.2f}")
@@ -1392,7 +1207,7 @@ class TradingBot:
         now = time.time()
         if now - self._last_jia_trigger < self._jia_ban_period:
             return
-        if now - getattr(self, '_last_jia_check', 0) < 60:
+        if now - self._last_jia_check < 60:
             return
         self._last_jia_check = now
 
@@ -1412,24 +1227,20 @@ class TradingBot:
             long_profit = (cp - long_pos['entry_price']) / long_pos['entry_price']
             short_profit = (short_pos['entry_price'] - cp) / short_pos['entry_price']
 
-            side = None
             if long_profit >= 0.02 and short_profit < 0:
-                side = 'LONG'
+                side, profit_value = 'LONG', long_profit
+                winner, loser = long_pos, short_pos
             elif short_profit >= 0.02 and long_profit < 0:
-                side = 'SHORT'
-            if side is None:
+                side, profit_value = 'SHORT', short_profit
+                winner, loser = short_pos, long_pos
+            else:
                 return
 
-            if side == 'LONG' and long_pos['quantity'] >= short_pos['quantity']:
+            if winner['quantity'] >= loser['quantity']:
+                loser_side = 'SHORT' if side == 'LONG' else 'LONG'
                 self.logger.debug(
-                    f"[check_jia] SOL LONG盈利 {long_profit:.2%}，但LONG仓位({long_pos['quantity']}) "
-                    f">= SHORT亏损仓位({short_pos['quantity']})，跳过BNB加仓"
-                )
-                return
-            if side == 'SHORT' and short_pos['quantity'] >= long_pos['quantity']:
-                self.logger.debug(
-                    f"[check_jia] SOL SHORT盈利 {short_profit:.2%}，但SHORT仓位({short_pos['quantity']}) "
-                    f">= LONG亏损仓位({long_pos['quantity']})，跳过BNB加仓"
+                    f"[check_jia] SOL {side}盈利 {profit_value:.2%}，但{side}仓位({winner['quantity']}) "
+                    f">= {loser_side}亏损仓位({loser['quantity']})，跳过BNB加仓"
                 )
                 return
 
@@ -1438,7 +1249,6 @@ class TradingBot:
                 self.logger.warning("[check_jia] 未找到 BNBUSDT 机器人，无法盈利加仓")
                 return
 
-            profit_value = long_profit if side == 'LONG' else short_profit
             self.logger.info(
                 f"[check_jia] SOL双向持仓，{side}盈利 {profit_value:.2%}，"
                 f"触发BNB同向开仓0.02"
@@ -1452,7 +1262,7 @@ class TradingBot:
     def check_he(self, all_bots):
         """≥4仓（多空并存）且合计盈利 > 合计亏损×1.3 → 全部平仓"""
         now = time.time()
-        if now - getattr(self, '_last_he_check', 0) < 60:
+        if now - self._last_he_check < 60:
             return
         self._last_he_check = now
 
@@ -1475,7 +1285,7 @@ class TradingBot:
                 if not cp or cp <= 0:
                     continue
 
-                for side in ['LONG', 'SHORT']:
+                for side in ('LONG', 'SHORT'):
                     pos = bot.current_position[side]
                     if pos['quantity'] <= 0 or not pos['entry_price']:
                         continue
@@ -1495,22 +1305,15 @@ class TradingBot:
                         total_loss += abs(pnl)
                         details.append(f"{bot.symbol}/{side}: -{abs(pnl):.4f}")
 
-            if position_count < 4:
-                return
-            if not (has_long and has_short):
-                return
-            if total_profit <= 0:
+            if position_count < 4 or not (has_long and has_short) or total_profit <= 0:
                 return
 
             if total_loss <= 0:
                 ratio = float('inf')
-                should_close = True
             else:
                 ratio = total_profit / total_loss
-                should_close = ratio > 1.3
-
-            if not should_close:
-                return
+                if ratio <= 1.3:
+                    return
 
             self.logger.info(
                 f"[check_he] 触发全部平仓！盈利合计={total_profit:.4f} USDT，"
@@ -1519,24 +1322,19 @@ class TradingBot:
             )
 
             for bot in all_bots:
-                try:
-                    bot.close_all('LONG', reason='check_he全部平仓-合计盈利>合计亏损1.3倍')
-                except Exception as e:
-                    self.logger.error(f"[check_he] {bot.symbol} 平LONG失败: {e}")
-                try:
-                    bot.close_all('SHORT', reason='check_he全部平仓-合计盈利>合计亏损1.3倍')
-                except Exception as e:
-                    self.logger.error(f"[check_he] {bot.symbol} 平SHORT失败: {e}")
+                for side in ('LONG', 'SHORT'):
+                    try:
+                        bot.close_all(side, reason='check_he全部平仓-合计盈利>合计亏损1.3倍')
+                    except Exception as e:
+                        self.logger.error(f"[check_he] {bot.symbol} 平{side}失败: {e}")
         except Exception as e:
             self.logger.error(f"[check_he] 执行异常: {e}")
 
     def check_xau(self, all_bots):
         """SPY 趋势切换时对 BNB 开仓0.02，并平反向"""
         target_symbols = ['BNBUSDT']
-        if not hasattr(self, '_last_xau_spy_trend'):
-            self._last_xau_spy_trend = None
 
-        current_spy_trend = getattr(self, '_spy_trend_mode', 'DUAL')
+        current_spy_trend = self._spy_trend_mode
         if current_spy_trend == self._last_xau_spy_trend:
             return
         self._last_xau_spy_trend = current_spy_trend
@@ -1657,128 +1455,140 @@ class TradingBot:
         profit_ratio = (cp - entry) / entry if side == 'LONG' else (entry - cp) / entry
 
         if -0.3 < profit_ratio < -0.002:
-            long_margin = self.current_position['LONG']['margin']
-            short_margin = self.current_position['SHORT']['margin']
-            if long_margin > bal * 0.04 and side == 'LONG':
-                self.execute_open_order('SHORT', 0.04)
-                self.logger.info("对冲-反向加空仓0.04")
-                self.sync_position()
-            if long_margin < bal * 0.04 and side == 'LONG':
-                self.execute_open_order('SHORT', 0.02)
-                self.logger.info("对冲-反向加空仓0.02")
-                self.sync_position()
-            if short_margin > bal * 0.04 and side == 'SHORT':
-                self.execute_open_order('LONG', 0.04)
-                self.logger.info("对冲-反向加多仓0.04")
-                self.sync_position()
-            if short_margin < bal * 0.04 and side == 'SHORT':
-                self.execute_open_order('LONG', 0.02)
-                self.logger.info("对冲-反向加多仓0.02")
-                self.sync_position()
+            self._hedge_losing_side(side, bal)
+        elif profit_ratio >= 0.01:
+            self._reduce_winning_side(side, pos, cp, profit_ratio)
+
+    def _hedge_losing_side(self, side, bal):
+        """亏损仓：按该方向保证金与 4% 余额的关系，反向加仓 0.04 / 0.02"""
+        opposite = 'SHORT' if side == 'LONG' else 'LONG'
+        margin = self.current_position[side]['margin']
+        threshold = bal * 0.04
+        if margin > threshold:
+            pct = 0.04
+        elif margin < threshold:
+            pct = 0.02
+        else:
+            return
+        self.execute_open_order(opposite, pct)
+        self.logger.info(f"对冲-反向加{'空' if opposite == 'SHORT' else '多'}仓{pct:.2f}")
+        self.sync_position()
+
+    def _reduce_winning_side(self, side, pos, cp, profit_ratio):
+        """盈利≥1% 且多空并存：限价挂单减仓20%"""
+        long_qty = self.current_position['LONG']['quantity']
+        short_qty = self.current_position['SHORT']['quantity']
+        if not (long_qty > 0 and short_qty > 0):
+            self.logger.debug(
+                f"[部分止盈跳过] {side} 单向持仓（LONG={long_qty}, SHORT={short_qty}）"
+            )
             return
 
-        elif profit_ratio >= 0.01:
-            long_qty = self.current_position['LONG']['quantity']
-            short_qty = self.current_position['SHORT']['quantity']
-            if not (long_qty > 0 and short_qty > 0):
-                self.logger.debug(
-                    f"[部分止盈跳过] {side} 单向持仓"
-                    f"（LONG={long_qty}, SHORT={short_qty}）"
-                )
+        try:
+            close_qty = self._round_qty(pos['quantity'] * 0.2)
+            if close_qty <= 0:
+                self.logger.warning(f"[盈利减仓20%] {side} 数量过小（{pos['quantity'] * 0.2}），跳过")
                 return
 
-            try:
-                reduce_ratio = 0.2
-                close_qty = self._round_qty(pos['quantity'] * reduce_ratio)
-                if close_qty <= 0:
-                    self.logger.warning(
-                        f"[盈利减仓20%] {side} 数量过小（{pos['quantity'] * reduce_ratio}），跳过"
-                    )
-                    return
+            if side == 'LONG':
+                limit_price = self._round_price(cp + 0.001)
+                order_side = SIDE_SELL
+            else:
+                limit_price = self._round_price(cp - 0.001)
+                order_side = SIDE_BUY
 
-                if side == 'LONG':
-                    limit_price = self._round_price(cp + 0.001)
-                    order_side = SIDE_SELL
-                else:
-                    limit_price = self._round_price(cp - 0.001)
-                    order_side = SIDE_BUY
+            if self._has_open_order('_reduce_', side):
+                self.logger.debug(f"[盈利减仓20%] {side} 方向已存在减仓挂单，跳过")
+                return
 
-                try:
-                    open_orders = client.futures_get_open_orders(symbol=self.symbol)
-                    for order in open_orders:
-                        if ('_reduce_' in order.get('clientOrderId', '')
-                                and order.get('positionSide') == side):
-                            self.logger.debug(f"[盈利减仓20%] {side} 方向已存在减仓挂单，跳过")
-                            return
-                except Exception as e:
-                    self.logger.warning(f"[盈利减仓20%] 查询挂单失败: {e}")
+            order = client.futures_create_order(
+                symbol=self.symbol,
+                side=order_side,
+                type=ORDER_TYPE_LIMIT,
+                timeInForce='GTC',
+                quantity=close_qty,
+                price=limit_price,
+                positionSide=side,
+                newClientOrderId=f"{self.symbol}_reduce_{side}_{int(time.time())}"
+            )
+            self.logger.info(
+                f"[盈利减仓20%] {side} 双向持仓限价挂单成功 数量={close_qty}，"
+                f"挂单价={limit_price:.4f}（现价{cp:.4f}，偏离0.001），"
+                f"盈利比例={profit_ratio:.4f}，订单ID={order['orderId']}"
+            )
+            time.sleep(1)
+            self.sync_position()
+        except Exception as e:
+            self.logger.error(f"[盈利减仓20%失败 {side}]: {e}")
 
-                order = client.futures_create_order(
-                    symbol=self.symbol,
-                    side=order_side,
-                    type=ORDER_TYPE_LIMIT,
-                    timeInForce='GTC',
-                    quantity=close_qty,
-                    price=limit_price,
-                    positionSide=side,
-                    newClientOrderId=f"{self.symbol}_reduce_{side}_{int(time.time())}"
-                )
-                self.logger.info(
-                    f"[盈利减仓20%] {side} 双向持仓限价挂单成功 数量={close_qty}，"
-                    f"挂单价={limit_price:.4f}（现价{cp:.4f}，偏离0.001），"
-                    f"盈利比例={profit_ratio:.4f}，订单ID={order['orderId']}"
-                )
-                time.sleep(1)
-                self.sync_position()
-            except Exception as e:
-                self.logger.error(f"[盈利减仓20%失败 {side}]: {e}")
-            return
+    # ===== 交易所规则 / 挂单工具 =====
 
-    # ===== 工具方法 =====
+    def _get_filters(self):
+        """缓存 stepSize / minQty / tickSize（1小时），避免每次下单都拉完整 exchangeInfo"""
+        now = time.time()
+        if self._filters and now - self._filters['ts'] < 3600:
+            return self._filters
+        try:
+            info = client.futures_exchange_info()
+            s = next(x for x in info['symbols'] if x['symbol'] == self.symbol)
+            f = {x['filterType']: x for x in s['filters']}
+            self._filters = {
+                'ts': now,
+                'step': float(f['LOT_SIZE']['stepSize']),
+                'min_qty': float(f['LOT_SIZE']['minQty']),
+                'tick': float(f['PRICE_FILTER']['tickSize']),
+            }
+        except Exception:
+            if not self._filters:
+                raise
+        return self._filters
 
     def _round_qty(self, qty):
         try:
-            symbol_info = next(
-                s for s in client.futures_exchange_info()['symbols']
-                if s['symbol'] == self.symbol
-            )
-            step_size = float(next(
-                f['stepSize'] for f in symbol_info['filters']
-                if f['filterType'] == 'LOT_SIZE'
-            ))
-            min_qty = float(next(
-                f['minQty'] for f in symbol_info['filters']
-                if f['filterType'] == 'LOT_SIZE'
-            ))
-            qty = round(round(qty / step_size) * step_size, 8)
-            return 0 if qty < min_qty else qty
+            flt = self._get_filters()
+            qty = round(round(qty / flt['step']) * flt['step'], 8)
+            return 0 if qty < flt['min_qty'] else qty
         except Exception:
             return round(qty, 4)
 
     def _round_price(self, price):
         try:
-            symbol_info = next(
-                s for s in client.futures_exchange_info()['symbols']
-                if s['symbol'] == self.symbol
-            )
-            tick_size = float(next(
-                f['tickSize'] for f in symbol_info['filters']
-                if f['filterType'] == 'PRICE_FILTER'
-            ))
-            return round(round(price / tick_size) * tick_size, 8)
+            tick = self._get_filters()['tick']
+            return round(round(price / tick) * tick, 8)
         except Exception:
             return round(price, 2)
 
+    def _has_open_order(self, tag, side):
+        """是否已有 clientOrderId 含 tag 且 positionSide==side 的挂单；查询失败返回 None"""
+        try:
+            for order in client.futures_get_open_orders(symbol=self.symbol):
+                if tag in order.get('clientOrderId', '') and order.get('positionSide') == side:
+                    return True
+            return False
+        except Exception as e:
+            self.logger.warning(f"[挂单查询] 失败: {e}")
+            return None
+
+    def _cancel_side_orders(self, side, log_prefix="[close_all] 取消"):
+        """撤销某方向的全部挂单"""
+        try:
+            for order in client.futures_get_open_orders(symbol=self.symbol):
+                if order.get('positionSide') == side:
+                    client.futures_cancel_order(symbol=self.symbol, orderId=order['orderId'])
+                    self.logger.info(f"{log_prefix} {side} 方向挂单，订单ID: {order['orderId']}")
+        except Exception as e:
+            self.logger.warning(f"[撤单] 取消 {side} 挂单失败: {e}")
+
     def can_open_side(self, side):
-        now = time.time()
         last_clear_time = self.last_clear_time.get(side)
-        if last_clear_time is not None and now < last_clear_time:
+        if last_clear_time is not None and time.time() < last_clear_time:
             return False
         return True
 
     def get_current_price(self):
-        if self.market_data['price'] is not None and self.market_data['price'] > 0:
-            return self.market_data['price']
+        price = self.market_data['price']
+        if price is not None and price > 0:
+            return price
         try:
             price = float(client.futures_symbol_ticker(symbol=self.symbol)['price'])
             if price <= 0:
@@ -1801,159 +1611,132 @@ class TradingBot:
 
     # ===== 仓位同步 =====
 
-    def sync_position(self):
-        """从交易所拉取持仓；处理仓位变化、加仓重置、归零反向挂单"""
-        try:
-            try:
-                current_price = float(client.futures_symbol_ticker(symbol=self.symbol)['price'])
-                if current_price > 0:
-                    self.market_data['price'] = current_price
-                    self.logger.debug(f"[价格同步] 更新市场价格: {current_price}")
-                else:
-                    self.logger.warning(f"[价格同步] 获取到无效价格: {current_price}，使用缓存价格")
-            except Exception as price_error:
+    def _fetch_exchange_positions(self):
+        """从交易所拉取当前持仓，返回 {'LONG': {...}, 'SHORT': {...}}"""
+        new_position = {side: self._empty_position() for side in ('LONG', 'SHORT')}
+        for pos in client.futures_position_information(symbol=self.symbol):
+            amt = float(pos.get('positionAmt', 0))
+            if abs(amt) <= 0:
+                continue
+            entry_price = float(pos.get('entryPrice', 0))
+            side = 'LONG' if amt > 0 else 'SHORT'
+            if entry_price == 0:
                 self.logger.warning(
-                    f"[价格同步] 获取实时价格失败: {price_error}，"
-                    f"使用缓存价格: {self.market_data.get('price', '无')}"
+                    f"[sync_position警告] {self.symbol} {side} 仓位存在但 entry_price=0，尝试使用上次记录的价格"
+                )
+                entry_price = self.current_position[side].get('entry_price') or 0
+                if entry_price == 0:
+                    self.logger.error("[sync_position错误] 无法获取有效的入场价格，跳过该仓位")
+                    continue
+            margin = abs(amt) * entry_price / self.leverage if self.leverage > 0 else 0
+            new_position[side].update({
+                'entry_price': entry_price,
+                'quantity': abs(amt),
+                'margin': round(margin, 4)
+            })
+        return new_position
+
+    def _merge_side_state(self, side, new_pos):
+        """把旧状态（开仓时间/止损止盈标记）合并进 new_pos；仓位归零时触发反向挂单"""
+        old = self.current_position[side]
+        old_qty, new_qty = old['quantity'], new_pos['quantity']
+
+        if old_qty > 0 and 0 < new_qty < old_qty and (old_qty - new_qty) / old_qty >= 0.6:
+            self.logger.info("[减仓超60%]")
+        if old_qty != new_qty:
+            self.logger.info(f"[仓位变化] {side}仓位从 {old_qty} 变为 {new_qty}")
+
+        if new_qty > 0:
+            if old_qty <= 0:
+                new_pos['open_time'] = time.time()
+                self.logger.info(
+                    f"[新开仓位] {side} 开仓时间记录: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            elif new_qty > old_qty:
+                new_pos['open_time'] = time.time()
+                increase_ratio = (new_qty - old_qty) / old_qty
+                if increase_ratio > 0.1:
+                    new_pos['stop_updated'] = False
+                    self.logger.info(
+                        f"[加仓重置动态止损] {side} 加仓比例={increase_ratio:.2%}，允许再次设置动态止损"
+                    )
+                self.logger.info(
+                    f"[加仓重置时间] {side} 加仓比例={increase_ratio:.2%}，持仓时间重新计算"
+                )
+            else:
+                new_pos['open_time'] = old.get('open_time')
+                if new_qty < old_qty:
+                    reduction_pct = (old_qty - new_qty) / old_qty
+                    self.logger.debug(f"[减仓保持时间] {side} 减仓{reduction_pct:.2%}，持仓时间保持不变")
+                new_pos['stop_updated'] = old.get('stop_updated', False)
+
+            for key in ('stop_price', 'take_profit_price'):
+                value = old.get(key)
+                new_pos[key] = value if (value is not None and value > 0) else None
+        else:
+            new_pos['open_time'] = None
+            new_pos['stop_price'] = None
+            new_pos['take_profit_price'] = None
+            new_pos['stop_updated'] = False
+
+            if old_qty > 0:
+                self.logger.info(f"[仓位清零] {side}仓位归零，重置时间并撤销止损单")
+                self.last_clear_time[side] = time.time() + self.ban_period
+                opposite_side = 'LONG' if side == 'SHORT' else 'SHORT'
+                self.execute_open_order(opposite_side, 0.02, delay=180)
+                self.logger.info(
+                    f"[仓位清零] {side}仓位归零，反向开仓{opposite_side}（延迟180秒）"
                 )
 
-            positions = client.futures_position_information(symbol=self.symbol)
-
-            new_position = {
-                "LONG": {
-                    "entry_price": None, "quantity": 0, "margin": 0,
-                    "stop_price": None, "take_profit_price": None,
-                    "stop_updated": False, "open_time": None
-                },
-                "SHORT": {
-                    "entry_price": None, "quantity": 0, "margin": 0,
-                    "stop_price": None, "take_profit_price": None,
-                    "stop_updated": False, "open_time": None
-                }
-            }
-
-            for pos in positions:
-                amt = float(pos.get('positionAmt', 0))
-                entry_price = float(pos.get('entryPrice', 0))
-                margin = abs(amt) * entry_price / self.leverage if self.leverage > 0 else 0
-                if abs(amt) <= 0:
-                    continue
-
-                side = 'LONG' if amt > 0 else 'SHORT'
-                if entry_price == 0:
+    def sync_position(self):
+        """从交易所拉取持仓；处理仓位变化、加仓重置、归零反向挂单"""
+        with self._pos_lock:     # 多线程（本 bot 线程 / check_he 跨 bot 调用）互斥
+            try:
+                try:
+                    current_price = float(client.futures_symbol_ticker(symbol=self.symbol)['price'])
+                    if current_price > 0:
+                        self.market_data['price'] = current_price
+                        self.logger.debug(f"[价格同步] 更新市场价格: {current_price}")
+                    else:
+                        self.logger.warning(f"[价格同步] 获取到无效价格: {current_price}，使用缓存价格")
+                except Exception as price_error:
                     self.logger.warning(
-                        f"[sync_position警告] {self.symbol} {side} 仓位存在但 entry_price=0，尝试使用上次记录的价格"
-                    )
-                    entry_price = self.current_position[side].get('entry_price', 0)
-                    if entry_price == 0:
-                        self.logger.error("[sync_position错误] 无法获取有效的入场价格，跳过该仓位")
-                        continue
-
-                new_position[side].update({
-                    'entry_price': entry_price,
-                    'quantity': abs(amt),
-                    'margin': round(margin, 4)
-                })
-
-            for side in ['LONG', 'SHORT']:
-                old_qty = self.current_position[side]['quantity']
-                new_qty = new_position[side]['quantity']
-
-                if old_qty > 0 and new_qty > 0 and new_qty < old_qty:
-                    reduction_ratio = (old_qty - new_qty) / old_qty
-                    if reduction_ratio >= 0.6:
-                        self.logger.info("[减仓超60%]")
-
-                if abs(old_qty - new_qty) > 0:
-                    self.logger.info(f"[仓位变化] {side}仓位从 {old_qty} 变为 {new_qty}")
-
-                if new_qty > 0:
-                    if old_qty <= 0:
-                        new_position[side]['open_time'] = time.time()
-                        self.logger.info(
-                            f"[新开仓位] {side} 开仓时间记录: "
-                            f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
-                        )
-                    elif new_qty > old_qty:
-                        new_position[side]['open_time'] = time.time()
-                        increase_ratio = (new_qty - old_qty) / old_qty if old_qty > 0 else 0
-                        if increase_ratio > 0.1:
-                            new_position[side]['stop_updated'] = False
-                            self.logger.info(
-                                f"[加仓重置动态止损] {side} 加仓比例={increase_ratio:.2%}，允许再次设置动态止损"
-                            )
-                        self.logger.info(
-                            f"[加仓重置时间] {side} 加仓比例={increase_ratio:.2%}，持仓时间重新计算"
-                        )
-                    else:
-                        new_position[side]['open_time'] = self.current_position[side].get('open_time')
-                        if new_qty < old_qty:
-                            reduction_pct = (old_qty - new_qty) / old_qty if old_qty > 0 else 0
-                            self.logger.debug(
-                                f"[减仓保持时间] {side} 减仓{reduction_pct:.2%}，持仓时间保持不变"
-                            )
-
-                    if (self.current_position[side].get('stop_price') is not None
-                            and self.current_position[side]['stop_price'] > 0):
-                        new_position[side]['stop_price'] = self.current_position[side].get('stop_price')
-                    else:
-                        new_position[side]['stop_price'] = None
-
-                    if (self.current_position[side].get('take_profit_price') is not None
-                            and self.current_position[side]['take_profit_price'] > 0):
-                        new_position[side]['take_profit_price'] = self.current_position[side].get('take_profit_price')
-                    else:
-                        new_position[side]['take_profit_price'] = None
-
-                    if new_qty <= old_qty:
-                        new_position[side]['stop_updated'] = self.current_position[side].get('stop_updated', False)
-                else:
-                    new_position[side]['open_time'] = None
-                    new_position[side]['stop_price'] = None
-                    new_position[side]['take_profit_price'] = None
-                    new_position[side]['stop_updated'] = False
-
-                if new_qty <= 0 and old_qty > 0:
-                    self.logger.info(f"[仓位清零] {side}仓位归零，重置时间并撤销止损单")
-                    self.last_clear_time[side] = time.time() + self.ban_period
-                    opposite_side = 'LONG' if side == 'SHORT' else 'SHORT'
-                    self.execute_open_order(opposite_side, 0.02, delay=180)
-                    self.logger.info(
-                        f"[仓位清零] {side}仓位归零，反向开仓{opposite_side}（延迟180秒）"
+                        f"[价格同步] 获取实时价格失败: {price_error}，"
+                        f"使用缓存价格: {self.market_data.get('price', '无')}"
                     )
 
-            self.current_position = new_position
+                new_position = self._fetch_exchange_positions()
+                for side in ('LONG', 'SHORT'):
+                    self._merge_side_state(side, new_position[side])
+                self.current_position = new_position
 
-            for side in ['LONG', 'SHORT']:
-                pos = self.current_position[side]
-                if pos['quantity'] > 0 and pos['entry_price']:
-                    cp = self.get_current_price()
-                    if cp and cp > 0:
+                cp = self.get_current_price()
+                for side in ('LONG', 'SHORT'):
+                    pos = self.current_position[side]
+                    if pos['quantity'] > 0 and pos['entry_price'] and cp and cp > 0:
                         loss_ratio = ((pos['entry_price'] - cp) / pos['entry_price']
                                       if side == 'LONG'
                                       else (cp - pos['entry_price']) / pos['entry_price'])
                         if loss_ratio >= 0.003:
                             self.logger.debug(f"[亏损监控] {side}仓亏损比例: {loss_ratio:.4f}")
+                    if pos['open_time']:
+                        hold_time = time.time() - pos['open_time']
+                        if hold_time > 0:
+                            self.logger.debug(f"[持仓时间] {side} 已持仓: {hold_time / 3600:.2f}小时")
 
-            for side in ['LONG', 'SHORT']:
-                if self.current_position[side]['open_time']:
-                    hold_time = time.time() - self.current_position[side]['open_time']
-                    if hold_time > 0:
-                        self.logger.debug(f"[持仓时间] {side} 已持仓: {hold_time / 3600:.2f}小时")
-
-            self.logger.debug(
-                f"[仓位同步完成] LONG: {self.current_position['LONG']['quantity']}, "
-                f"SHORT: {self.current_position['SHORT']['quantity']}"
-            )
-        except Exception as e:
-            self.logger.error(f"持仓同步异常: {e}")
-            self.logger.warning("同步异常，保持原有仓位数据")
+                self.logger.debug(
+                    f"[仓位同步完成] LONG: {self.current_position['LONG']['quantity']}, "
+                    f"SHORT: {self.current_position['SHORT']['quantity']}"
+                )
+            except Exception as e:
+                self.logger.error(f"持仓同步异常: {e}")
+                self.logger.warning("同步异常，保持原有仓位数据")
 
     def get_balance(self):
         """USDT 可用余额（20秒缓存）"""
         now = time.time()
-        if hasattr(self, '_bal_time') and now - self._bal_time < 20:
-            return getattr(self, '_bal_value', 0)
+        if now - self._bal_time < 20:
+            return self._bal_value
 
         for attempt in range(3):
             try:
@@ -1965,12 +1748,12 @@ class TradingBot:
                 self._bal_value = result
                 return result
             except Exception as e:
-                if "Timeout" in str(e) or "-1007" in str(e):
-                    if attempt < 2:
-                        time.sleep(3)
-                        continue
+                if ("Timeout" in str(e) or "-1007" in str(e)) and attempt < 2:
+                    time.sleep(3)
+                    continue
                 self.logger.error(f"获取余额失败: {e}")
-                return getattr(self, '_bal_value', 0)
+                return self._bal_value
+        return self._bal_value
 
     # ===== 开仓 =====
 
@@ -1980,9 +1763,9 @@ class TradingBot:
             return
 
         if delay > 0:
-            if side in self._delayed_timers:
-                self._delayed_timers[side].cancel()
-                del self._delayed_timers[side]
+            old_timer = self._delayed_timers.pop(side, None)
+            if old_timer:
+                old_timer.cancel()
 
             def delayed():
                 try:
@@ -1990,7 +1773,7 @@ class TradingBot:
                 except Exception as e:
                     self.logger.error(f"[延时开仓执行失败] {e}")
                 finally:
-                    if side in self._delayed_timers:
+                    if self._delayed_timers.get(side) is timer:
                         del self._delayed_timers[side]
 
             timer = threading.Timer(delay, delayed)
@@ -2004,11 +1787,7 @@ class TradingBot:
             self.logger.warning(f"余额无效: {bal}")
             return
 
-        long_margin = self.current_position['LONG']['margin']
-        short_margin = self.current_position['SHORT']['margin']
-        if long_margin > bal * 0.03 and side == 'LONG':
-            return
-        if short_margin > bal * 0.03 and side == 'SHORT':
+        if self.current_position[side]['margin'] > bal * 0.03:
             return
 
         price = self.get_current_price()
@@ -2016,31 +1795,18 @@ class TradingBot:
             return
 
         try:
-            symbol_info = next(
-                s for s in client.futures_exchange_info()['symbols']
-                if s['symbol'] == self.symbol
-            )
-            min_qty = float(next(
-                f['minQty'] for f in symbol_info['filters']
-                if f['filterType'] == 'LOT_SIZE'
-            ))
-            step_size = float(next(
-                f['stepSize'] for f in symbol_info['filters']
-                if f['filterType'] == 'LOT_SIZE'
-            ))
-
+            flt = self._get_filters()
             qty = bal * percentage * self.leverage / price
-            qty = round(qty / step_size) * step_size
-            qty = max(qty, min_qty)
+            qty = round(qty / flt['step']) * flt['step']
+            qty = max(qty, flt['min_qty'])
             qty = self._round_qty(qty)
             if qty <= 0:
                 self.logger.warning(f"[市价开仓] {side} 数量过小，跳过")
                 return
 
-            order_side = SIDE_BUY if side == 'LONG' else SIDE_SELL
             order = client.futures_create_order(
                 symbol=self.symbol,
-                side=order_side,
+                side=SIDE_BUY if side == 'LONG' else SIDE_SELL,
                 type=ORDER_TYPE_MARKET,
                 quantity=qty,
                 positionSide=side,
@@ -2074,7 +1840,8 @@ class TradingBot:
             tp_price = self._round_price(cp + 0.001) if side == 'LONG' else self._round_price(cp - 0.001)
             offset_desc = "盈利偏移0.001"
         else:
-            tp_price = self._round_price(entry * (1 + 0.004)) if side == 'LONG' else self._round_price(entry * (1 - 0.004))
+            tp_price = (self._round_price(entry * (1 + 0.004)) if side == 'LONG'
+                        else self._round_price(entry * (1 - 0.004)))
             offset_desc = "反弹至盈利0.004"
 
         qty = self._round_qty(pos['quantity'] * 0.5)
@@ -2084,23 +1851,19 @@ class TradingBot:
             )
             return
 
-        order_side = SIDE_SELL if side == 'LONG' else SIDE_BUY
-
-        try:
-            open_orders = client.futures_get_open_orders(symbol=self.symbol)
-            for order in open_orders:
-                if '_close_' in order.get('clientOrderId', '') and order.get('positionSide') == side:
-                    self._close_pending[side] = True
-                    self.logger.debug(f"[减仓50%止盈] {side} 方向已存在止盈挂单，不允许再挂单")
-                    return
-        except Exception as e:
-            self.logger.warning(f"[减仓50%止盈] 查询挂单失败，出于安全不挂单: {e}")
+        exists = self._has_open_order('_close_', side)
+        if exists is None:
+            self.logger.warning("[减仓50%止盈] 查询挂单失败，出于安全不挂单")
+            return
+        if exists:
+            self._close_pending[side] = True
+            self.logger.debug(f"[减仓50%止盈] {side} 方向已存在止盈挂单，不允许再挂单")
             return
 
         try:
-            order = client.futures_create_order(
+            client.futures_create_order(
                 symbol=self.symbol,
-                side=order_side,
+                side=SIDE_SELL if side == 'LONG' else SIDE_BUY,
                 type=ORDER_TYPE_LIMIT,
                 timeInForce='GTC',
                 quantity=qty,
@@ -2125,94 +1888,60 @@ class TradingBot:
     def close_all(self, side, reason=""):
         """市价平掉指定方向全部仓位，并清理该方向挂单；失败则限价兜底"""
         self.sync_position()
-
-        try:
-            open_orders = client.futures_get_open_orders(symbol=self.symbol)
-            for order in open_orders:
-                if order.get('positionSide') == side:
-                    client.futures_cancel_order(symbol=self.symbol, orderId=order['orderId'])
-                    self.logger.info(f"[close_all] 取消 {side} 方向挂单，订单ID: {order['orderId']}")
-        except Exception as e:
-            self.logger.warning(f"[close_all] 取消挂单失败: {e}")
+        self._cancel_side_orders(side)
 
         pos = self.current_position.get(side)
         if not pos or pos['quantity'] <= 0:
             self.logger.info(f"[close_all] {side} 无持仓，跳过")
             return
-
-        qty = pos['quantity']
-        entry_price = pos['entry_price']
-        if not entry_price or entry_price <= 0:
+        if not pos['entry_price'] or pos['entry_price'] <= 0:
             self.logger.error(f"[close_all] {side} 入场价无效，无法平仓")
             return
 
         order_side = SIDE_SELL if side == 'LONG' else SIDE_BUY
-        qty_fmt = self._round_qty(qty)
+        qty_fmt = self._round_qty(pos['quantity'])
         if qty_fmt <= 0:
-            self.logger.warning(f"[close_all] {side} 数量过小（{qty}），无法下单")
+            self.logger.warning(f"[close_all] {side} 数量过小（{pos['quantity']}），无法下单")
             return
 
         max_retry = 3
         for attempt in range(max_retry):
             try:
                 order = client.futures_create_order(
-                    symbol=self.symbol,
-                    side=order_side,
-                    type=ORDER_TYPE_MARKET,
-                    quantity=qty_fmt,
-                    positionSide=side
+                    symbol=self.symbol, side=order_side, type=ORDER_TYPE_MARKET,
+                    quantity=qty_fmt, positionSide=side
                 )
-                self.logger.info(
-                    f"[close_all] {side} 全部平仓成功，数量 {qty_fmt}，"
-                    f"订单ID {order.get('orderId')}，原因: {reason}"
-                )
-                time.sleep(1)
-                self.sync_position()
-                try:
-                    open_orders = client.futures_get_open_orders(symbol=self.symbol)
-                    for order in open_orders:
-                        if order.get('positionSide') == side:
-                            client.futures_cancel_order(symbol=self.symbol, orderId=order['orderId'])
-                            self.logger.debug(
-                                f"[平仓清理] 取消订单 {order['orderId']} ({order.get('side')})"
-                            )
-                except Exception as e:
-                    self.logger.warning(f"[平仓清理] 取消订单失败: {e}")
-                return
             except Exception as e:
                 self.logger.error(f"[close_all] 平仓尝试 {attempt + 1}/{max_retry} 失败: {e}")
                 if attempt < max_retry - 1:
                     time.sleep(2)
-                else:
-                    self.logger.warning("[close_all] 市价单全部失败，尝试限价单兜底")
-                    try:
-                        current_price = self.get_current_price()
-                        if not current_price:
-                            raise ValueError("无有效价格")
-                        limit_price = self._round_price(
-                            current_price * 0.995 if side == 'LONG' else current_price * 1.005
-                        )
-                        order = client.futures_create_order(
-                            symbol=self.symbol,
-                            side=order_side,
-                            type=ORDER_TYPE_LIMIT,
-                            timeInForce='GTC',
-                            quantity=qty_fmt,
-                            price=limit_price,
-                            positionSide=side
-                        )
-                        self.logger.info(f"[close_all] 限价单兜底平仓成功，订单ID {order.get('orderId')}")
-                        time.sleep(1)
-                        self.sync_position()
-                        try:
-                            open_orders = client.futures_get_open_orders(symbol=self.symbol)
-                            for order in open_orders:
-                                if order.get('positionSide') == side:
-                                    client.futures_cancel_order(symbol=self.symbol, orderId=order['orderId'])
-                        except Exception:
-                            pass
-                    except Exception as e2:
-                        self.logger.error(f"[close_all] 限价单兜底也失败: {e2}，请手动处理")
+                continue
+
+            self.logger.info(
+                f"[close_all] {side} 全部平仓成功，数量 {qty_fmt}，"
+                f"订单ID {order.get('orderId')}，原因: {reason}"
+            )
+            time.sleep(1)
+            self.sync_position()
+            self._cancel_side_orders(side, log_prefix="[平仓清理] 取消")
+            return
+
+        self.logger.warning("[close_all] 市价单全部失败，尝试限价单兜底")
+        try:
+            current_price = self.get_current_price()
+            if not current_price:
+                raise ValueError("无有效价格")
+            limit_price = self._round_price(current_price * (0.995 if side == 'LONG' else 1.005))
+            order = client.futures_create_order(
+                symbol=self.symbol, side=order_side, type=ORDER_TYPE_LIMIT,
+                timeInForce='GTC', quantity=qty_fmt, price=limit_price, positionSide=side
+            )
+            self.logger.info(f"[close_all] 限价单兜底平仓成功，订单ID {order.get('orderId')}")
+            time.sleep(1)
+            self.sync_position()
+            self._cancel_side_orders(side, log_prefix="[平仓清理] 取消")
+        except Exception as e2:
+            self.logger.error(f"[close_all] 限价单兜底也失败: {e2}，请手动处理")
 
     def check_stop_conditions(self, side):
         """盈利 ≥ 9% 时安排 8 秒后减仓50%止盈"""
@@ -2231,12 +1960,12 @@ class TradingBot:
         profit_ratio = (cp - entry) / entry if side == 'LONG' else (entry - cp) / entry
 
         if profit_ratio < 0.09:
-            if side in self._close_timer and self._close_timer[side]:
+            if self._close_timer.get(side):
                 self._close_timer[side].cancel()
                 self._close_timer[side] = None
             return
 
-        if side in self._close_timer and self._close_timer[side] is not None:
+        if self._close_timer.get(side) is not None:
             return
         timer = threading.Timer(8.0, self.close, args=[side])
         timer.daemon = True
@@ -2282,7 +2011,7 @@ def initialize_global_client():
             twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
             twm.start()
             for _ in range(10):
-                if hasattr(twm, '_running') and twm._running:
+                if getattr(twm, '_running', False):
                     break
                 time.sleep(0.5)
             else:
@@ -2295,9 +2024,8 @@ def initialize_global_client():
             logging.error(f"客户端初始化尝试 {attempt + 1}/{max_retries} 失败: {e}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
-            else:
-                logging.error("客户端初始化最终失败")
-                return False
+    logging.error("客户端初始化最终失败")
+    return False
 
 
 def update_global_equity():
@@ -2326,43 +2054,42 @@ def global_data_updater():
             global_btc_manager.update_btc_trend()
             global_spy_manager.update_spy_1m_data()
             global_spy_manager.update_spy_3m_data()
-            time.sleep(60)
         except Exception as e:
             logging.error(f"全局数据更新异常: {e}")
-            time.sleep(60)
+        time.sleep(60)
 
 
-def cleanup_old_logs(log_file='multi_bot.log', max_lines=1000):
+def cleanup_old_logs(path=None, max_lines=1000):
     """主循环内定期截断日志"""
     try:
-        if os.path.exists(log_file):
-            with open(log_file, 'r', errors='ignore') as f:
-                lines = f.readlines()
-            if len(lines) > max_lines:
-                with open(log_file, 'w', encoding='utf-8') as f:
-                    f.writelines(lines[-max_lines:])
-                    f.write("\n=== 日志已清理 ===\n")
+        original = _truncate_log(path or log_file, max_lines)
+        if original is not None:
+            with open(path or log_file, 'a', encoding='utf-8') as f:
+                f.write("\n=== 日志已清理 ===\n")
     except Exception as e:
         logging.error(f"日志清理失败: {e}")
 
 
 def global_monitor():
     """后台线程：整点输出持仓报告/情绪报告，并触发情绪开仓"""
+    last_report_key = None
     while True:
         try:
-            now = datetime.datetime.utcnow()
-            if now.minute == 0 and now.second < 10:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            report_key = now.strftime('%Y%m%d%H')
+            if now.minute == 0 and now.second < 10 and report_key != last_report_key:
+                last_report_key = report_key     # 同一小时只报告一次（原版10秒轮询窗口可能重复）
                 logging.info(f"[全局监控] 时间: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
                 for bot in trading_bots:
-                    long_qty = bot.current_position['LONG']['quantity']
-                    short_qty = bot.current_position['SHORT']['quantity']
-                    long_margin = bot.current_position['LONG'].get('margin', 0)
-                    short_margin = bot.current_position['SHORT'].get('margin', 0)
-                    if long_qty > 0 or short_qty > 0:
+                    long_pos = bot.current_position['LONG']
+                    short_pos = bot.current_position['SHORT']
+                    if long_pos['quantity'] > 0 or short_pos['quantity'] > 0:
                         logging.info(
-                            f"[持仓报告] {bot.symbol}: LONG={long_qty:.4f}(保证金:{long_margin:.2f}), "
-                            f"SHORT={short_qty:.4f}(保证金:{short_margin:.2f})"
+                            f"[持仓报告] {bot.symbol}: LONG={long_pos['quantity']:.4f}"
+                            f"(保证金:{long_pos.get('margin', 0):.2f}), "
+                            f"SHORT={short_pos['quantity']:.4f}"
+                            f"(保证金:{short_pos.get('margin', 0):.2f})"
                         )
 
                 btc_prices = global_btc_manager.get_btc_3m_prices()
@@ -2371,21 +2098,19 @@ def global_monitor():
 
                 btc_mode, btc_start = global_btc_manager.get_trend_state()
                 if btc_mode != 'DUAL' and btc_start > 0:
-                    dur_h = (time.time() - btc_start) / 3600
-                    logging.info(f"[BTC趋势] {btc_mode} 已持续 {dur_h:.2f}h")
+                    logging.info(f"[BTC趋势] {btc_mode} 已持续 {(time.time() - btc_start) / 3600:.2f}h")
 
+                trigger_key = now.strftime('%Y%m%d%H%M')
                 for bot in trading_bots:
                     try:
-                        trigger_key = now.strftime('%Y%m%d%H%M')
-                        if getattr(bot, '_sentiment_trigger_key', None) == trigger_key:
+                        if bot._sentiment_trigger_key == trigger_key:
                             continue
-
-                        symbol_sentiment = sentiment_analyzer.get_sentiment_level(bot.symbol)
-                        if symbol_sentiment == "SLIGHTLY_BULLISH":
+                        level = sentiment_analyzer.get_sentiment_level(bot.symbol)
+                        if level == "SLIGHTLY_BULLISH":
                             bot.logger.info(f"[情绪触发] {bot.symbol} SLIGHTLY_BULLISH，开多仓 0.01")
                             bot.execute_open_order('LONG', 0.01)
                             bot._sentiment_trigger_key = trigger_key
-                        elif symbol_sentiment == "SLIGHTLY_BEARISH":
+                        elif level == "SLIGHTLY_BEARISH":
                             bot.logger.info(f"[情绪触发] {bot.symbol} SLIGHTLY_BEARISH，开空仓 0.01")
                             bot.execute_open_order('SHORT', 0.01)
                             bot._sentiment_trigger_key = trigger_key
@@ -2393,8 +2118,7 @@ def global_monitor():
                         logging.error(f"[情绪触发] {bot.symbol} 开仓失败: {e}")
 
                 for symbol in TRADING_SYMBOLS + ASSISTANT_SYMBOLS:
-                    sentiment = sentiment_analyzer.get_sentiment_level(symbol)
-                    logging.info(f"[情绪报告] {symbol}: {sentiment}")
+                    logging.info(f"[情绪报告] {symbol}: {sentiment_analyzer.get_sentiment_level(symbol)}")
 
             correlation_analyzer.update_correlation_matrix()
             time.sleep(10)
@@ -2408,7 +2132,7 @@ def emergency_stop():
     logging.warning("[紧急停止] 触发紧急停止，开始市价平仓")
     try:
         for bot in trading_bots:
-            for side in ['LONG', 'SHORT']:
+            for side in ('LONG', 'SHORT'):
                 try:
                     bot.close_all(side, reason='emergency_stop')
                 except Exception as e:
@@ -2437,12 +2161,6 @@ def cleanup_all_orders_on_startup(bots):
 
         for order in open_orders:
             order_id = order.get('orderId')
-            cid = order.get('clientOrderId', 'N/A')
-            side = order.get('side')
-            pos_side = order.get('positionSide')
-            qty = order.get('origQty')
-            price = order.get('price')
-
             cancelled = False
             for attempt in range(3):
                 try:
@@ -2450,22 +2168,23 @@ def cleanup_all_orders_on_startup(bots):
                     cancelled = True
                     break
                 except Exception as e:
-                    err_str = str(e)
-                    if '-2011' in err_str or 'Unknown order' in err_str:
+                    if '-2011' in str(e) or 'Unknown order' in str(e):
                         cancelled = True
                         break
                     if attempt < 2:
                         time.sleep(1)
                     else:
                         logging.error(
-                            f"[启动清理失败] {bot.symbol} 订单 {order_id} ({cid}) 撤销失败: {e}"
+                            f"[启动清理失败] {bot.symbol} 订单 {order_id} "
+                            f"({order.get('clientOrderId', 'N/A')}) 撤销失败: {e}"
                         )
 
             if cancelled:
                 total_cancelled += 1
                 logging.info(
-                    f"[启动清理] {bot.symbol} 撤销挂单 "
-                    f"{cid} | {side} {pos_side} qty={qty} price={price}"
+                    f"[启动清理] {bot.symbol} 撤销挂单 {order.get('clientOrderId', 'N/A')} | "
+                    f"{order.get('side')} {order.get('positionSide')} "
+                    f"qty={order.get('origQty')} price={order.get('price')}"
                 )
             else:
                 total_failed += 1
@@ -2477,14 +2196,14 @@ def cleanup_all_orders_on_startup(bots):
 def setup_signal_handlers():
     """安装 SIGINT/SIGTERM/SIGQUIT 优雅退出处理器"""
     def signal_handler(signum, frame):
-        signame = (
-            signal.Signals(signum).name
-            if hasattr(signal.Signals, signum)
-            else str(signum)
-        )
+        # 原版 hasattr(signal.Signals, signum) 传入 int 会抛 TypeError，导致处理器本身崩溃
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = str(signum)
         logging.info(f"[优雅关闭] 接收到信号 {signame}，准备关闭程序...")
 
-        if 'twm' in globals() and twm:
+        if twm:
             try:
                 twm.stop()
                 logging.info("WebSocket管理器已停止")
@@ -2500,23 +2219,26 @@ def setup_signal_handlers():
                 logging.info(f"  {bot.symbol}: LONG={long_qty:.4f}, SHORT={short_qty:.4f}")
 
         logging.info("[优雅关闭] 程序退出，仓位保持")
-        exit(0)
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGQUIT, signal_handler)
+    if hasattr(signal, 'SIGQUIT'):          # Windows 没有 SIGQUIT
+        signal.signal(signal.SIGQUIT, signal_handler)
     logging.info("[信号处理器] 已安装优雅关闭处理器")
 
 
 def daemon_restart():
-    """异常时指数退避自动重启子进程（最多50次）"""
+    """异常时指数退避自动重启子进程（最多50次；子进程稳定运行 ≥1 小时则计数清零）"""
     restart_count = 0
     max_restarts = 50
     base_restart_delay = 10
+    stable_seconds = 3600
 
     setup_signal_handlers()
 
     while restart_count < max_restarts:
+        started = time.time()
         try:
             logging.info(f"启动交易程序 (重启次数: {restart_count})")
             process = subprocess.Popen(
@@ -2531,25 +2253,26 @@ def daemon_restart():
             return_code = process.wait()
             logging.error(f"主程序退出，返回码: {return_code}")
 
-            delay = min(base_restart_delay * (2 ** restart_count), 300)
-            restart_count += 1
-
             if return_code == 0:
                 logging.info("程序正常退出，不再重启")
                 break
-            elif return_code == 100:
+            if return_code == 100:
                 logging.info("程序请求不重启")
                 break
-            else:
-                logging.warning(f"程序异常退出，{delay}秒后重启... (第{restart_count}次)")
-                time.sleep(delay)
+
+            if time.time() - started >= stable_seconds:
+                restart_count = 0
+            delay = min(base_restart_delay * (2 ** restart_count), 300)
+            restart_count += 1
+            logging.warning(f"程序异常退出，{delay}秒后重启... (第{restart_count}次)")
+            time.sleep(delay)
         except KeyboardInterrupt:
             logging.info("守护进程被用户中断")
             break
         except Exception as e:
             logging.error(f"守护进程异常: {e}")
-            restart_count += 1
             delay = min(base_restart_delay * (2 ** restart_count), 300)
+            restart_count += 1
             logging.warning(f"{delay}秒后重启... (第{restart_count}次)")
             time.sleep(delay)
 
@@ -2560,17 +2283,16 @@ def daemon_restart():
 def main_program():
     """主程序：初始化、启动各线程、主循环"""
     global trading_bots
+    executor = None
     try:
         if not initialize_global_client():
             logging.error("全局客户端初始化失败")
             return 1
 
-        data_thread = threading.Thread(target=global_data_updater, daemon=True)
-        data_thread.start()
+        threading.Thread(target=global_data_updater, daemon=True).start()
         logging.info("全局数据更新线程已启动")
 
-        monitor_thread = threading.Thread(target=global_monitor, daemon=True)
-        monitor_thread.start()
+        threading.Thread(target=global_monitor, daemon=True).start()
         logging.info("全局监控线程已启动")
 
         try:
@@ -2623,41 +2345,39 @@ def main_program():
 
         setup_signal_handlers()
 
+        # 线程池只建一次；某 bot 上一轮还没跑完时本轮跳过它，避免同一 bot 并发执行
+        executor = ThreadPoolExecutor(max_workers=min(len(trading_bots), 4))
+        running = {}                      # bot -> Future
         health_check_counter = 0
-        last_successful_operation = time.time()
 
         while True:
             try:
-                if trading_bots:
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
-                    with ThreadPoolExecutor(max_workers=min(len(trading_bots), 4)) as executor:
-                        future_to_bot = {
-                            executor.submit(bot.enhanced_trading_strategy): bot
-                            for bot in trading_bots
-                        }
-                        for future in as_completed(future_to_bot.keys(), timeout=30):
-                            bot = future_to_bot[future]
-                            try:
-                                future.result()
-                            except Exception as e:
-                                logging.error(f"{bot.symbol} 策略执行异常: {e}")
+                futures = {}
+                for bot in trading_bots:
+                    prev = running.get(bot)
+                    if prev is not None and not prev.done():
+                        continue
+                    fut = executor.submit(bot.enhanced_trading_strategy)
+                    running[bot] = fut
+                    futures[fut] = bot
 
-                last_successful_operation = time.time()
+                for fut in as_completed(futures, timeout=30):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        logging.error(f"{futures[fut].symbol} 策略执行异常: {e}")
+
                 health_check_counter += 1
                 if health_check_counter >= 30:
                     cleanup_old_logs()
                     health_check_counter = 0
-
-                if time.time() - last_successful_operation > 300:
-                    logging.warning("长时间无成功操作，但已禁用WebSocket手动重启，依赖自动重连")
-                    last_successful_operation = time.time()
 
                 # 全局风控：每轮刷新账户权益并检查峰值回撤熔断
                 update_global_equity()
                 if global_risk_manager.should_stop_trading():
                     logging.error(
                         f"[全局风险] 触发停止交易条件（最大回撤 "
-                        f"{global_risk_manager.max_drawdown:.2%} > 25%），程序退出并全平"
+                        f"{global_risk_manager.max_drawdown:.2%} > {MAX_DRAWDOWN_LIMIT:.0%}），程序退出并全平"
                     )
                     emergency_stop()
                     return 100
@@ -2673,7 +2393,9 @@ def main_program():
         logging.error(f"主程序异常: {e}")
         return 4
     finally:
-        if 'twm' in globals() and twm:
+        if executor:
+            executor.shutdown(wait=False)
+        if twm:
             try:
                 twm.stop()
                 logging.info("WebSocket管理器已停止")
@@ -2688,15 +2410,14 @@ def main_program():
 # =============================================================================
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '--child':
-        exit_code = main_program()
-        sys.exit(exit_code)
+        sys.exit(main_program())
     elif len(sys.argv) > 1 and sys.argv[1] == '--daemon':
         print("启动虎鲸策略 V1 守护进程...")
         print("程序日志将输出到 multi_bot.log")
         print("按 Ctrl+C 停止守护进程")
         daemon_restart()
     else:
+        # 原版这里只 print 提示就结束了，什么都不会运行；改为真正直接运行
         print("直接运行虎鲸策略 V1...")
         print("按 Ctrl+C 停止程序")
-        exit_code = main_program()
-        sys.exit(exit_code)
+        sys.exit(main_program())
