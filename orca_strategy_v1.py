@@ -341,8 +341,7 @@ class CorrelationAnalyzer:
 
 RISK_STATE_FILE = 'risk_state.json'
 
-# 峰值回撤熔断阈值。原版代码里判断用的是 0.45，但日志/注释写的是 25%，两处不一致；
-# 这里保持判断值 0.45 不变，并让日志与注释统一引用此常量。
+# 峰值回撤熔断阈值0.45
 MAX_DRAWDOWN_LIMIT = 0.45
 
 
