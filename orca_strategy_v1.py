@@ -1177,9 +1177,9 @@ class TradingBot:
                 for bot in all_bots:
                     bot.close('SHORT')
                     if bot.symbol == 'BNBUSDT':
-                        bot.execute_open_order('LONG', 0.02)
-                    if allow_long and bot.symbol == 'XRPUSDT':
                         bot.execute_open_order('LONG', 0.04)
+                    if allow_long and bot.symbol == 'XRPUSDT':
+                        bot.execute_open_order('LONG', 0.06)
             elif down_condition:
                 self.logger.info(
                     f"[check_qiang] 强势下跌触发（15分钟跌破，放量{vol_ratio:.1f}倍），"
@@ -1191,9 +1191,9 @@ class TradingBot:
                 for bot in all_bots:
                     bot.close('LONG')
                     if bot.symbol == 'BNBUSDT':
-                        bot.execute_open_order('SHORT', 0.02)
-                    if allow_short and bot.symbol == 'XRPUSDT':
                         bot.execute_open_order('SHORT', 0.04)
+                    if allow_short and bot.symbol == 'XRPUSDT':
+                        bot.execute_open_order('SHORT', 0.06)
             else:
                 self.logger.debug(f"[check_qiang] 未触发：vol_ratio={vol_ratio:.2f}, close={close:.2f}")
         except Exception as e:
