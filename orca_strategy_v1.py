@@ -83,19 +83,16 @@ API_KEY = os.getenv('BINANCE_API_KEY', '')
 API_SECRET = os.getenv('BINANCE_API_SECRET', '')
 
 
-def _cfg(stop_loss_pct):
+def _cfg():
     return {
         'leverage': 10,
-        'stop_loss_pct': stop_loss_pct,
-        'take_profit_pct': 0.03,
         'position_percentage': 0.02,
-        'min_position_qty': 0.001,
-        'price_check_interval': 2,
     }
 
 
 TRADING_CONFIG = {
-    'SOLUSDT': _cfg(0.065),
+    'SOLUSDT': _cfg(),
+    'XRPUSDT': _cfg(),
 }
 
 TRADING_SYMBOLS = ['SOLUSDT']
@@ -578,7 +575,7 @@ class TradingBot:
     def __init__(self, symbol, btc_symbol=BTC_SYMBOL):
         self.symbol = symbol
         self.btc_symbol = btc_symbol
-        self.config = TRADING_CONFIG.get(symbol, _cfg(0.06))
+        self.config = TRADING_CONFIG.get(symbol, _cfg())
         self.logger = SymbolLogger(symbol)
         self.leverage = self.config['leverage']
 
